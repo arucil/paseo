@@ -1026,3 +1026,76 @@ test("scoped descriptor builds allocate independently of archived history", asyn
     await rm(home, { recursive: true, force: true });
   }
 }, 30000);
+
+test("shares an in-flight descriptor build across concurrent workspace fetches", async () => {
+  const workspace: PersistedWorkspaceRecord = {
+    workspaceId: "workspace-concurrent",
+    projectId: "project-concurrent",
+    cwd: "/workspace/concurrent",
+    kind: "local_checkout",
+    displayName: "main",
+    createdAt: NOW,
+    updatedAt: NOW,
+    archivedAt: null,
+  };
+  const project: PersistedProjectRecord = {
+    projectId: "project-concurrent",
+    rootPath: workspace.cwd,
+    kind: "git",
+    displayName: "concurrent",
+    customName: null,
+    createdAt: NOW,
+    updatedAt: NOW,
+    archivedAt: null,
+  };
+  let descriptorBuilds = 0;
+  const directory = new WorkspaceDirectory({
+    logger: createTestLogger(),
+    projectRegistry: { list: async () => [project] },
+    workspaceRegistry: {
+      listActive: async () => [workspace],
+      get: async (id) => (id === workspace.workspaceId ? workspace : null),
+    },
+    listAgentPayloads: async () => [],
+    workspaceLastUserMessageTimes: async () => new Map(),
+    listProviderSubagentActivity: async () => [],
+    listTerminalActivityContributions: async () => [],
+    isProviderVisibleToClient: () => true,
+    buildWorkspaceDescriptor: async ({ workspace: record }) => {
+      descriptorBuilds += 1;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      return {
+        id: record.workspaceId,
+        projectId: record.projectId,
+        projectDisplayName: project.displayName,
+        projectCustomName: null,
+        projectRootPath: project.rootPath,
+        workspaceDirectory: record.cwd,
+        projectKind: "git",
+        workspaceKind: record.kind,
+        background: false,
+        name: record.displayName,
+        title: null,
+        pinnedAt: null,
+        archivingAt: null,
+        status: "done",
+        statusEnteredAt: NOW,
+        activityAt: null,
+        createdAt: NOW,
+        diffStat: null,
+        scripts: [],
+        gitRuntime: null,
+        githubRuntime: null,
+      };
+    },
+  });
+
+  const [first, second] = await Promise.all([
+    directory.listFetchEntries({ type: "fetch_workspaces_request", requestId: "first" }),
+    directory.listFetchEntries({ type: "fetch_workspaces_request", requestId: "second" }),
+  ]);
+
+  expect(descriptorBuilds).toBe(1);
+  expect(first.entries.map((entry) => entry.id)).toEqual([workspace.workspaceId]);
+  expect(second.entries.map((entry) => entry.id)).toEqual([workspace.workspaceId]);
+});

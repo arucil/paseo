@@ -171,6 +171,10 @@ function activeWorkspaceRecords(
 
 export class WorkspaceDirectory {
   private readonly archivingByWorkspaceId = new Map<string, string>();
+  // A GUI can reconnect or replay its bootstrap while the previous request is
+  // still building descriptors. Share only the in-flight read: a completed
+  // result must not become a stale workspace cache.
+  private descriptorMapPromise: Promise<Map<string, WorkspaceDescriptorPayload>> | null = null;
   /**
    * Per-workspace last-seen winning bucket + entered-at. Persists across
    * `buildDescriptorMap` calls inside the daemon process; reset on cold start.
@@ -625,13 +629,11 @@ export class WorkspaceDirectory {
   // Every active workspace, background ones included. Callers that answer a
   // listing go through matchesFilter so background workspaces stay opt-in.
   async listDescriptors(): Promise<WorkspaceDescriptorPayload[]> {
-    return Array.from(
-      (
-        await this.buildDescriptorMap({
-          includeGitData: true,
-        })
-      ).values(),
-    );
+    this.descriptorMapPromise ??= this.buildDescriptorMap({ includeGitData: true }).finally(() => {
+      this.descriptorMapPromise = null;
+    });
+    const descriptors = await this.descriptorMapPromise;
+    return Array.from(descriptors.values());
   }
 
   matchesFilter(input: {
