@@ -124,6 +124,39 @@ describe("buildAgentLsFetchOptions", () => {
 });
 
 describe("runLsCommand", () => {
+  it("includes lifecycle details needed by watcher reconciliation in JSON data", async () => {
+    const client = createPagingClient();
+    const fetchAgents: typeof client.fetchAgents = async () => ({
+      entries: [
+        {
+          agent: {
+            ...(await client.fetchAgents()).entries[0]!.agent,
+            model: "gpt-5.4",
+            currentModeId: "full-access",
+            effectiveThinkingOptionId: "xhigh",
+            archivedAt: null,
+            labels: { "linear-issue": "ENG-1" },
+            pendingPermissions: [{ id: "permission-1", name: "external-write" }],
+          },
+        },
+      ],
+      pageInfo: { nextCursor: null },
+    });
+    const result = await listAgents({ daemonTarget, all: true, global: true }, async () => ({
+      ...client,
+      fetchAgents,
+    }));
+
+    expect(result.data[0]).toMatchObject({
+      model: "gpt-5.4",
+      thinking: "xhigh",
+      mode: "full-access",
+      archivedAt: null,
+      labels: { "linear-issue": "ENG-1" },
+      pendingPermissionCount: 1,
+    });
+  });
+
   it("lists agents on every page, including one updated during the listing", async () => {
     const result = await listAgents({ daemonTarget, all: true, global: true }, async () =>
       createPagingClient(),
