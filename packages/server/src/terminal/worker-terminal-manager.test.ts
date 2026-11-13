@@ -1757,7 +1757,8 @@ it("leaves a worker from a newer Paseo running, reports it incompatible, and clo
 
   await manager.closeTerminals();
 
-  expect(isProcessAlive(newer.workerPid)).toBe(false);
+  // Socket cleanup completes before process.exit, so wait for the worker to exit.
+  await waitForCondition(() => !isProcessAlive(newer.workerPid), 10000);
   expect(isProcessAlive(newer.programPid)).toBe(false);
   expect(await workerRecords(paseoHome)).toEqual([]);
 });
