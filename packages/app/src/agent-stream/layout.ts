@@ -1,6 +1,6 @@
 import type { TurnTiming } from "@/timeline/turn-time";
 import type { StreamItem } from "@/types/stream";
-import { getAssistantBlockSpacing, getGapBetweenStreamItems } from "./spacing";
+import { getAssistantMessageSpacing, getGapBetweenStreamItems } from "./spacing";
 import type { StreamFrameChildOrder, StreamStrategy } from "./strategy";
 import { continuesResponse, continuesTurn, isResponseBoundary } from "./turn-membership";
 
@@ -15,8 +15,6 @@ export interface TurnFooterHost {
 
 export interface StreamLayoutItem {
   item: StreamItem;
-  index: number;
-  items: StreamItem[];
   aboveItem: StreamItem | null;
   belowItem: StreamItem | null;
   gapBelow: number;
@@ -41,13 +39,13 @@ export interface StreamLayoutInput {
   isTurnActive: boolean;
   history: StreamItem[];
   liveHead: StreamItem[];
-  timingByAssistantId: Map<string, TurnTiming>;
+  timingByItemId: Map<string, TurnTiming>;
 }
 
 interface LayoutSegmentInput {
   strategy: StreamStrategy;
   items: StreamItem[];
-  timingByAssistantId: Map<string, TurnTiming>;
+  timingByItemId: Map<string, TurnTiming>;
   auxiliaryTurnFooter: TurnFooterHost | null;
   hasAuxiliaryFooter: boolean;
   frameOrder: StreamFrameChildOrder;
@@ -59,8 +57,8 @@ interface LayoutSegmentInput {
   phase: "streaming" | "complete";
 }
 
-interface AssistantFooterSource {
-  item: Extract<StreamItem, { kind: "assistant_message" }>;
+interface TurnFooterSource {
+  item: StreamItem;
   items: StreamItem[];
   index: number;
 }
@@ -69,23 +67,26 @@ function createTurnFooterHost(input: {
   item: StreamItem;
   items: StreamItem[];
   index: number;
-  timingByAssistantId: Map<string, TurnTiming>;
+  timingByItemId: Map<string, TurnTiming>;
 }): TurnFooterHost {
   return {
     itemId: input.item.id,
     items: input.items,
-    timing: input.timingByAssistantId.get(input.item.id),
+    timing: input.timingByItemId.get(input.item.id),
     startIndex: input.index,
   };
 }
 
-function findLatestAssistantInResponse(input: {
+function findTurnFooterSource(input: {
   strategy: StreamStrategy;
   items: StreamItem[];
   startIndex: number;
   boundaryAboveItems?: StreamItem[] | null;
   boundaryAboveIndex?: number | null;
-}): AssistantFooterSource | null {
+}): TurnFooterSource | null {
+  const last = input.items[input.startIndex];
+  const toolFallback: TurnFooterSource | null =
+    last?.kind === "tool_call" ? { item: last, items: input.items, index: input.startIndex } : null;
   let items = input.items;
   let index = input.startIndex;
   let canCrossBoundary = true;
@@ -99,7 +100,7 @@ function findLatestAssistantInResponse(input: {
     ) {
       const item = items[index];
       if (!item || (laterItem && !continuesResponse(item, laterItem))) {
-        return null;
+        return toolFallback;
       }
       if (item.kind === "assistant_message") {
         return { item, items, index };
@@ -113,7 +114,7 @@ function findLatestAssistantInResponse(input: {
       input.boundaryAboveIndex === null ||
       input.boundaryAboveIndex === undefined
     ) {
-      return null;
+      return toolFallback;
     }
 
     items = input.boundaryAboveItems;
@@ -133,20 +134,20 @@ function resolveAuxiliaryTurnFooter(input: StreamLayoutInput): TurnFooterHost | 
     return null;
   }
 
-  const assistant = findLatestAssistantInResponse({
+  const source = findTurnFooterSource({
     strategy: input.strategy,
     items: footerItems,
     startIndex: latestIndex,
   });
-  if (!assistant) {
+  if (!source) {
     return null;
   }
 
   return createTurnFooterHost({
-    item: assistant.item,
-    items: assistant.items,
-    index: assistant.index,
-    timingByAssistantId: input.timingByAssistantId,
+    item: source.item,
+    items: source.items,
+    index: source.index,
+    timingByItemId: input.timingByItemId,
   });
 }
 
@@ -156,7 +157,7 @@ function resolveCompletedFooter(input: {
   index: number;
   item: StreamItem;
   belowItem: StreamItem | null;
-  timingByAssistantId: Map<string, TurnTiming>;
+  timingByItemId: Map<string, TurnTiming>;
   auxiliaryTurnFooter: TurnFooterHost | null;
   boundaryAboveItems: StreamItem[] | null;
   boundaryAboveIndex: number | null;
@@ -165,21 +166,21 @@ function resolveCompletedFooter(input: {
     return null;
   }
 
-  const assistant = findLatestAssistantInResponse({
+  const source = findTurnFooterSource({
     strategy: input.strategy,
     items: input.items,
     startIndex: input.index,
     boundaryAboveItems: input.boundaryAboveItems,
     boundaryAboveIndex: input.boundaryAboveIndex,
   });
-  if (!assistant || input.auxiliaryTurnFooter?.itemId === assistant.item.id) {
+  if (!source || input.auxiliaryTurnFooter?.itemId === source.item.id) {
     return null;
   }
   return createTurnFooterHost({
-    item: assistant.item,
-    items: assistant.items,
-    index: assistant.index,
-    timingByAssistantId: input.timingByAssistantId,
+    item: source.item,
+    items: source.items,
+    index: source.index,
+    timingByItemId: input.timingByItemId,
   });
 }
 
@@ -232,60 +233,107 @@ function getSegmentNeighbor(input: {
   return null;
 }
 
-function layoutSegment(input: LayoutSegmentInput): StreamLayoutItem[] {
-  return input.items.map((item, index) => {
-    const aboveItem = getSegmentNeighbor({
-      strategy: input.strategy,
-      items: input.items,
-      index,
-      relation: "above",
-      boundaryIndex: input.boundaryIndex,
-      boundaryItem: input.boundaryAboveItem,
-    });
-    const belowItem = getSegmentNeighbor({
-      strategy: input.strategy,
-      items: input.items,
-      index,
-      relation: "below",
-      boundaryIndex: input.boundaryIndex,
-      boundaryItem: input.boundaryBelowItem,
-    });
-    const completedFooter = resolveCompletedFooter({
-      strategy: input.strategy,
-      items: input.items,
-      index,
-      item,
-      belowItem,
-      timingByAssistantId: input.timingByAssistantId,
-      auxiliaryTurnFooter: input.auxiliaryTurnFooter,
-      boundaryAboveItems: input.boundaryAboveItems,
-      boundaryAboveIndex: input.boundaryAboveIndex,
-    });
-    const assistantSpacing = getAssistantBlockSpacing({
-      item,
-      aboveItem,
-      belowItem,
-      hasFooterBelow: completedFooter !== null || (input.hasAuxiliaryFooter && belowItem === null),
-    });
+// Last layout emitted for each stream item. A row only rerenders when its layout item identity
+// changes, so an item whose render-relevant layout is unchanged must keep its previous object even
+// when the surrounding array was rebuilt (a new row shifts every index in a newest-first list).
+const previousLayoutItemByStreamItem = new WeakMap<StreamItem, StreamLayoutItem>();
 
-    return {
-      item,
-      index,
-      items: input.items,
-      aboveItem,
-      belowItem,
-      gapBelow: completedFooter ? 0 : getGapBetweenStreamItems(item, belowItem),
-      assistantSpacing,
-      completedFooter,
-      toolSequence: getToolSequence({ item, aboveItem, belowItem }),
-      isFirstInUserGroup: item.kind === "user_message" && aboveItem?.kind !== "user_message",
-      isLastInUserGroup: item.kind === "user_message" && belowItem?.kind !== "user_message",
-      isLastInToolSequence:
-        isToolSequenceItem(item) &&
-        !(isToolSequenceItem(belowItem) && continuesTurn(item, belowItem)),
-      frameOrder: input.frameOrder,
-      phase: input.phase,
-    };
+function areTurnFooterHostsEqual(
+  left: TurnFooterHost | null,
+  right: TurnFooterHost | null,
+): boolean {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return (
+    left.itemId === right.itemId &&
+    left.timing === right.timing &&
+    left.startIndex === right.startIndex &&
+    left.items === right.items
+  );
+}
+
+function areLayoutItemsEquivalent(previous: StreamLayoutItem, next: StreamLayoutItem): boolean {
+  return (
+    previous.item === next.item &&
+    previous.aboveItem === next.aboveItem &&
+    previous.belowItem === next.belowItem &&
+    previous.gapBelow === next.gapBelow &&
+    previous.assistantSpacing === next.assistantSpacing &&
+    areTurnFooterHostsEqual(previous.completedFooter, next.completedFooter) &&
+    previous.toolSequence === next.toolSequence &&
+    previous.isFirstInUserGroup === next.isFirstInUserGroup &&
+    previous.isLastInUserGroup === next.isLastInUserGroup &&
+    previous.isLastInToolSequence === next.isLastInToolSequence &&
+    previous.frameOrder === next.frameOrder &&
+    previous.phase === next.phase
+  );
+}
+
+function shareLayoutItem(next: StreamLayoutItem): StreamLayoutItem {
+  const previous = previousLayoutItemByStreamItem.get(next.item);
+  if (previous && areLayoutItemsEquivalent(previous, next)) {
+    return previous;
+  }
+  previousLayoutItemByStreamItem.set(next.item, next);
+  return next;
+}
+
+function layoutSegment(input: LayoutSegmentInput): StreamLayoutItem[] {
+  return input.items.map((item, index) => layoutSegmentItem(input, item, index));
+}
+
+function layoutSegmentItem(
+  input: LayoutSegmentInput,
+  item: StreamItem,
+  index: number,
+): StreamLayoutItem {
+  const aboveItem = getSegmentNeighbor({
+    strategy: input.strategy,
+    items: input.items,
+    index,
+    relation: "above",
+    boundaryIndex: input.boundaryIndex,
+    boundaryItem: input.boundaryAboveItem,
+  });
+  const belowItem = getSegmentNeighbor({
+    strategy: input.strategy,
+    items: input.items,
+    index,
+    relation: "below",
+    boundaryIndex: input.boundaryIndex,
+    boundaryItem: input.boundaryBelowItem,
+  });
+  const completedFooter = resolveCompletedFooter({
+    strategy: input.strategy,
+    items: input.items,
+    index,
+    item,
+    belowItem,
+    timingByItemId: input.timingByItemId,
+    auxiliaryTurnFooter: input.auxiliaryTurnFooter,
+    boundaryAboveItems: input.boundaryAboveItems,
+    boundaryAboveIndex: input.boundaryAboveIndex,
+  });
+  const assistantSpacing = getAssistantMessageSpacing({
+    item,
+    hasFooterBelow: completedFooter !== null || (input.hasAuxiliaryFooter && belowItem === null),
+  });
+
+  return shareLayoutItem({
+    item,
+    aboveItem,
+    belowItem,
+    gapBelow: completedFooter ? 0 : getGapBetweenStreamItems(item, belowItem),
+    assistantSpacing,
+    completedFooter,
+    toolSequence: getToolSequence({ item, aboveItem, belowItem }),
+    isFirstInUserGroup: item.kind === "user_message" && aboveItem?.kind !== "user_message",
+    isLastInUserGroup: item.kind === "user_message" && belowItem?.kind !== "user_message",
+    isLastInToolSequence:
+      isToolSequenceItem(item) &&
+      !(isToolSequenceItem(belowItem) && continuesTurn(item, belowItem)),
+    frameOrder: input.frameOrder,
+    phase: input.phase,
   });
 }
 
@@ -330,7 +378,7 @@ export function layoutStream(input: StreamLayoutInput): StreamLayout {
       history = layoutSegment({
         strategy: input.strategy,
         items: input.history,
-        timingByAssistantId: input.timingByAssistantId,
+        timingByItemId: input.timingByItemId,
         auxiliaryTurnFooter,
         hasAuxiliaryFooter,
         frameOrder,
@@ -350,7 +398,7 @@ export function layoutStream(input: StreamLayoutInput): StreamLayout {
   const liveHead = layoutSegment({
     strategy: input.strategy,
     items: input.liveHead,
-    timingByAssistantId: input.timingByAssistantId,
+    timingByItemId: input.timingByItemId,
     auxiliaryTurnFooter,
     hasAuxiliaryFooter,
     frameOrder,

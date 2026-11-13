@@ -10,12 +10,18 @@ export interface ForegroundTurnWaiter {
   resolveSettled: () => void;
 }
 
+type ForegroundRunStart =
+  | { status: "pending" }
+  | { status: "started"; turnId: string }
+  | { status: "failed"; error: string };
+
 export interface PendingForegroundRun {
   token: string;
   kind: "foreground";
   stagedEvents: AgentStreamEvent[];
-  turnId: string | null;
-  started: boolean;
+  start: ForegroundRunStart;
+  turnStartedPromise: Promise<void>;
+  resolveTurnStarted: () => void;
   settled: boolean;
   settledPromise: Promise<void>;
   resolveSettled: () => void;
@@ -52,6 +58,28 @@ export class AgentRunState {
     return run?.kind === "foreground" ? run : null;
   }
 
+  settleForegroundStart(
+    run: PendingForegroundRun,
+    start: Exclude<ForegroundRunStart, { status: "pending" }>,
+  ): void {
+    run.start = start;
+    if (start.status === "started") {
+      run.resolveTurnStarted();
+    }
+  }
+
+  /**
+   * Resolves once the agent's foreground run has a turn id or has ended. A failed start
+   * resolves only once its run is cleared, so callers never see a failed run still tracked.
+   */
+  async waitForForegroundStart(agentId: string): Promise<void> {
+    const run = this.getPendingRun(agentId);
+    if (run?.start.status !== "pending") {
+      return;
+    }
+    await Promise.race([run.turnStartedPromise, run.settledPromise]);
+  }
+
   hasPendingRun(agentId: string): boolean {
     return this.getPendingRun(agentId) !== null;
   }
@@ -62,6 +90,13 @@ export class AgentRunState {
 
   hasRun(agentId: string): boolean {
     return this.runs.has(agentId);
+  }
+
+  getTurnId(agentId: string): string | null {
+    const run = this.runs.get(agentId);
+    if (!run) return null;
+    if (run.kind === "autonomous") return run.turnId;
+    return run.start.status === "started" ? run.start.turnId : null;
   }
 
   trackAutonomousRun(agentId: string, turnId: string | null): TrackedAgentRun {
@@ -85,7 +120,10 @@ export class AgentRunState {
     if (!run) {
       return;
     }
-    if (run.kind === "foreground" && (run.turnId === null || run.turnId !== turnId)) {
+    if (
+      run.kind === "foreground" &&
+      (run.start.status !== "started" || run.start.turnId !== turnId)
+    ) {
       return;
     }
     if (
@@ -265,11 +303,16 @@ export class ForegroundTurnStream {
 }
 
 function createPendingForegroundRun(): PendingForegroundRun {
+  let resolveTurnStarted!: () => void;
+  const turnStartedPromise = new Promise<void>((resolvePromise) => {
+    resolveTurnStarted = resolvePromise;
+  });
   return {
     ...createTrackedRunState(),
     kind: "foreground",
-    turnId: null,
-    started: false,
+    start: { status: "pending" },
+    turnStartedPromise,
+    resolveTurnStarted,
     stagedEvents: [],
   };
 }

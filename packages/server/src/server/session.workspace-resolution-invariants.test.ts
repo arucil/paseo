@@ -1,3 +1,9 @@
+import { createWorkspaceRuntimeStore } from "./workspace-runtime-store/index.js";
+import { createAgentMessageDeliveryStub } from "./test-utils/session-stubs.js";
+import {
+  createMessageReceiptsStub,
+  createTestCreationService,
+} from "./test-utils/session-stubs.js";
 // Invariant tests for cwd → workspace resolution on the open_project_request path.
 // Each test encodes a default behavior we want from `findOrCreateWorkspaceForDirectory`.
 // Run to see which invariants the current code already satisfies (green) and which
@@ -74,7 +80,6 @@ function createHarness(input: {
         mainRepoRoot: null,
       };
     },
-    peekSnapshot: () => null,
   });
 
   const emitted: SessionOutboundMessage[] = [];
@@ -88,6 +93,10 @@ function createHarness(input: {
   };
 
   const session = new Session({
+    workspaceRuntimeStore: createWorkspaceRuntimeStore(),
+    messageReceipts: createMessageReceiptsStub(),
+    agentMessages: createAgentMessageDeliveryStub(),
+    creationService: createTestCreationService(),
     clientId: "test",
     permissions: OWNER_PERMISSIONS,
     appVersion: null,
@@ -106,7 +115,10 @@ function createHarness(input: {
       notifyAgentState: () => {},
     }),
     agentStorage: createStub<SessionOptions["agentStorage"]>({
-      list: async () => [],
+      listAll: async () => [],
+      listActive: async () => [],
+      listByWorkspaces: async () => [],
+      lastUserMessageAtByWorkspace: async () => new Map<string, string>(),
       get: async () => null,
     }),
     projectRegistry: createStub<SessionOptions["projectRegistry"]>({
@@ -146,7 +158,9 @@ function createHarness(input: {
       subscribeToMutations: () => () => {},
       initialize: async () => {},
       existsOnDisk: async () => true,
-      list: async () => Array.from(workspaces.values()),
+      listAll: async () => Array.from(workspaces.values()),
+      listActive: async () =>
+        Array.from(workspaces.values()).filter((record) => !record.archivedAt),
       get: async (id: string) => workspaces.get(id) ?? null,
       upsert: async (record: PersistedWorkspaceRecord) => {
         workspaces.set(record.workspaceId, record);

@@ -1,9 +1,14 @@
+import type { AgentSnapshotPayload } from "@getpaseo/protocol/messages";
 import { create } from "zustand";
 import type { ComposerAttachment } from "@/attachments/types";
 import type { AgentProvider } from "@getpaseo/protocol/agent-types";
 import type { WorkspaceDraftTabSetup } from "@/workspace-tabs/model";
 
 export interface PendingWorkspaceDraftSubmission {
+  /** Already-running creation. Mounting the draft only observes its result. */
+  agentCreation?: {
+    result: Promise<AgentSnapshotPayload>;
+  };
   serverId: string;
   workspaceId: string;
   draftId: string;
@@ -16,7 +21,7 @@ export interface PendingWorkspaceDraftSubmission {
   modeId?: string;
   model?: string;
   thinkingOptionId?: string;
-  featureValues?: Record<string, unknown>;
+  providerOptions?: Record<string, unknown>;
   allowEmptyText?: boolean;
 }
 
@@ -82,7 +87,6 @@ export const useWorkspaceDraftSubmissionStore = create<WorkspaceDraftSubmissionS
       const normalizedDraftId = normalizeDraftId(draftId);
       if (!normalizedDraftId) return;
       set((state) => {
-        if (!state.setupByDraftId[normalizedDraftId]) return state;
         const { [normalizedDraftId]: _removed, ...setupByDraftId } = state.setupByDraftId;
         return { setupByDraftId };
       });
@@ -96,8 +100,10 @@ export const useWorkspaceDraftSubmissionStore = create<WorkspaceDraftSubmissionS
         if (!matchesPendingSubmission(state.pendingByDraftId[input.draftId], input)) {
           return state;
         }
-        const { [input.draftId]: _removed, ...rest } = state.pendingByDraftId;
-        return { pendingByDraftId: rest };
+        // Expo miscompiles computed member-key rest omissions; test the emitted code.
+        const pendingByDraftId = { ...state.pendingByDraftId };
+        delete pendingByDraftId[input.draftId];
+        return { pendingByDraftId };
       });
       return pending;
     },

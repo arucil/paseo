@@ -5,6 +5,12 @@ import { z } from "zod";
 
 import { terminateWithTreeKill } from "../../../../utils/tree-kill.js";
 
+import { ProviderLineReader, ProviderStreamLimitError } from "../jsonl-frame-decoder.js";
+
+// A measured long-thread resume was 19.75 MB; preserve the existing 32 MiB fixture
+// with 4x margin for longer threads. This is provider stdout, not the client protocol.
+export const CODEX_PROVIDER_LINE_BYTES = 128 * 1024 * 1024;
+
 const DEFAULT_TIMEOUT_MS = 14 * 24 * 60 * 60 * 1000;
 const APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_MS = 2_000;
 const APP_SERVER_FORCE_SHUTDOWN_TIMEOUT_MS = 1_000;
@@ -28,10 +34,25 @@ interface JsonRpcNotification {
 }
 
 interface PendingRequest {
+  method: string;
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
 }
+
+/** A response past the provider line cap. Only its request fails; the session stays up. */
+export class CodexAppServerResponseTooLargeError extends Error {
+  constructor(
+    readonly method: string,
+    readonly limitBytes: number,
+  ) {
+    super(`Codex app-server response to ${method} exceeds ${limitBytes} bytes`);
+    this.name = "CodexAppServerResponseTooLargeError";
+  }
+}
+
+// Codex serializes a response with `id` first, so its head names the request.
+const OVERSIZED_RESPONSE_HEAD = /^\{"id":(\d+),"result":/;
 
 export class CodexAppServerRpcError extends Error {
   constructor(
@@ -44,12 +65,46 @@ export class CodexAppServerRpcError extends Error {
   }
 }
 
+interface CodexAppServerExitDetails {
+  exitCode: number | null;
+  exitSignal: NodeJS.Signals | null;
+  stderr: string;
+}
+
+export class CodexAppServerExitError extends Error {
+  readonly reason: "sqlite_state_initialization" | "other";
+  readonly exitCode: number | null;
+  readonly exitSignal: NodeJS.Signals | null;
+  readonly stderr: string;
+
+  constructor(details: CodexAppServerExitDetails) {
+    const message =
+      details.exitCode === 0 && !details.exitSignal
+        ? "Codex app-server exited"
+        : `Codex app-server exited with code ${details.exitCode ?? "null"} and signal ${details.exitSignal ?? "null"}`;
+    super(`${message}\n${details.stderr}`.trim());
+    this.name = "CodexAppServerExitError";
+    this.exitCode = details.exitCode;
+    this.exitSignal = details.exitSignal;
+    this.stderr = details.stderr;
+    // Codex reports this pre-initialize failure only on stderr, not as a
+    // JSON-RPC error. Classify it here so callers branch on a typed reason.
+    this.reason =
+      details.exitCode === 1 &&
+      !details.exitSignal &&
+      details.stderr.includes("failed to initialize sqlite state runtime")
+        ? "sqlite_state_initialization"
+        : "other";
+  }
+}
+
 type RequestHandler = (params: unknown, requestId: number) => unknown;
 type NotificationHandler = (method: string, params: unknown) => void;
 type UnexpectedTerminationHandler = (error: Error) => void;
 
 export interface CodexThreadForkParams {
   threadId: string;
+  beforeTurnId?: string | null;
   path?: string | null;
   model?: string | null;
   modelProvider?: string | null;
@@ -197,14 +252,24 @@ export class CodexAppServerClient {
       this.handleUnexpectedTermination(err);
     });
 
+    const reportExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      this.handleUnexpectedTermination(
+        new CodexAppServerExitError({
+          exitCode: code,
+          exitSignal: signal,
+          stderr: this.stderrBuffer,
+        }),
+      );
+    };
     child.on("exit", (code, signal) => {
-      const message =
-        code === 0 && !signal
-          ? "Codex app-server exited"
-          : `Codex app-server exited with code ${code ?? "null"} and signal ${signal ?? "null"}`;
-      const error = new Error(`${message}\n${this.stderrBuffer}`.trim());
-      this.handleUnexpectedTermination(error);
+      // Startup retries need complete diagnostics. Node drains the child's
+      // stdio before close, but exit can precede the final stderr data.
+      const initializing = Array.from(this.pending.values()).some(
+        (request) => request.method === "initialize",
+      );
+      if (!initializing) reportExit(code, signal);
     });
+    child.on("close", reportExit);
   }
 
   setUnexpectedTerminationHandler(handler: UnexpectedTerminationHandler): void {
@@ -217,6 +282,10 @@ export class CodexAppServerClient {
 
   setRequestHandler(method: string, handler: RequestHandler): void {
     this.requestHandlers.set(method, handler);
+  }
+
+  hasPendingRequests(): boolean {
+    return this.pending.size > 0 || this.activeProviderRequests > 0;
   }
 
   request(method: string, params?: unknown, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<unknown> {
@@ -232,7 +301,7 @@ export class CodexAppServerClient {
         this.pending.delete(id);
         reject(new Error(`Codex app-server request timed out for ${method}`));
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { method, resolve, reject, timer });
     });
   }
 
@@ -253,7 +322,6 @@ export class CodexAppServerClient {
   }
 
   async dispose(): Promise<void> {
-    if (this.disposed) return;
     this.disposed = true;
     this.unexpectedTerminationHandler = null;
     this.closeStdoutReader();
@@ -273,11 +341,30 @@ export class CodexAppServerClient {
       },
     });
     if (result === "kill-timeout") {
-      this.logger.warn(
-        { timeoutMs: APP_SERVER_FORCE_SHUTDOWN_TIMEOUT_MS },
-        "Codex app-server did not report exit after SIGKILL",
-      );
+      throw new Error("Codex app-server did not report exit after SIGKILL");
     }
+  }
+
+  private handleStreamLimit(failure: ProviderStreamLimitError): void {
+    const responseId = OVERSIZED_RESPONSE_HEAD.exec(failure.lineHead)?.[1];
+    const pending = responseId === undefined ? undefined : this.pending.get(Number(responseId));
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.pending.delete(Number(responseId));
+      this.logger.warn(
+        { method: pending.method, limitBytes: failure.limitBytes },
+        "Codex app-server response exceeded the line cap",
+      );
+      pending.reject(new CodexAppServerResponseTooLargeError(pending.method, failure.limitBytes));
+      return;
+    }
+    // A lost notification or server request cannot be replayed. Fail the session,
+    // including live turns with no pending RPC, rather than dropping a stream unit.
+    this.stdoutLineReader.close();
+    this.handleUnexpectedTermination(failure);
+    void this.dispose().catch((err) => {
+      this.logger.warn({ err }, "Failed to terminate oversized Codex stdout producer");
+    });
   }
 
   private handleUnexpectedTermination(error: Error): void {
@@ -301,6 +388,14 @@ export class CodexAppServerClient {
     } catch (handlerError) {
       this.logger.warn({ err: handlerError }, "Codex app-server termination handler threw");
     }
+  }
+
+  private rejectPending(error: Error): void {
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
+    this.pending.clear();
   }
 
   private writeJsonRpcResponse(response: JsonRpcResponse): void {
@@ -396,6 +491,7 @@ export class CodexAppServerClient {
         this.traceRawEvent(request);
         const handler = this.requestHandlers.get(request.method);
         try {
+          this.activeProviderRequests++;
           const result = handler ? await handler(request.params, request.id) : {};
           this.writeJsonRpcResponse({ id: request.id, result });
         } catch (error) {
@@ -403,6 +499,8 @@ export class CodexAppServerClient {
             id: request.id,
             error: { message: error instanceof Error ? error.message : String(error) },
           });
+        } finally {
+          this.activeProviderRequests--;
         }
         return;
       }

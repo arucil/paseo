@@ -1,3 +1,4 @@
+import type { AppState } from "react-native";
 import type { ActiveWorkspaceSelection } from "@/stores/navigation-active-workspace-store";
 import type {
   DaemonStartCondition,
@@ -116,6 +117,8 @@ export interface ResolveIndexStartupRouteInput extends ResolveStartupRouteBaseIn
   workspaceSelectionStatus: WorkspaceSelectionStatus;
   isWorkspaceSelectionLoaded: boolean;
   hasGivenUpWaitingForHost: boolean;
+  /** Setup may still open over the empty home; see `useIsSetupDecisionPending`. */
+  isWaitingForSetup: boolean;
 }
 
 export interface ResolveHostStartupRouteInput extends ResolveStartupRouteBaseInput {
@@ -197,6 +200,12 @@ function resolveReadyIndexStartupRoute(input: ResolveIndexStartupRouteInput): St
     };
   }
 
+  // Without a workspace to restore, startup lands on the empty home. A new user's setup opens
+  // over it, so hold the splash until that is known instead of flashing the home first.
+  if (input.isWaitingForSetup) {
+    return { kind: "splash" };
+  }
+
   if (input.anyOnlineHostServerId) {
     return { kind: "redirect", href: buildHostRootRoute(input.anyOnlineHostServerId) };
   }
@@ -249,4 +258,15 @@ export function resolveStartupRoute(input: ResolveStartupRouteInput): StartupRou
   }
 
   return resolveReadyIndexStartupRoute(input);
+}
+
+export function bindHostRuntimeAppState(
+  store: { setAppVisible: (visible: boolean) => void },
+  appState: Pick<typeof AppState, "currentState" | "addEventListener">,
+): () => void {
+  const subscription = appState.addEventListener("change", (state) => {
+    store.setAppVisible(state === "active");
+  });
+  store.setAppVisible(appState.currentState === "active");
+  return () => subscription.remove();
 }

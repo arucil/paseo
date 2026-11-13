@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
+import { i18n } from "@/i18n/i18next";
 import type { SidebarWorkspaceEntry } from "./sidebar-workspaces-view-model";
 import {
   buildStatusGroups,
   buildStatusShortcutIndex,
-  STATUS_BUCKET_LABELS,
+  getStatusBucketLabel,
   STATUS_BUCKET_ORDER,
   type StatusGroup,
 } from "./sidebar-status-view-model";
@@ -61,7 +62,7 @@ describe("buildStatusGroups", () => {
       ws({ workspaceKey: "srv:running-ws", statusBucket: "running", name: "running-ws" }),
     ];
 
-    const groups = buildStatusGroups(workspaces, emptyProjectNames);
+    const groups = buildStatusGroups(workspaces, emptyProjectNames, i18n.t);
 
     expect(groups.map((g) => g.bucket)).toEqual(["needs_input", "running", "done"]);
     expect(groups[0]?.label).toBe("Needs input");
@@ -75,7 +76,7 @@ describe("buildStatusGroups", () => {
       ws({ workspaceKey: "srv:b", statusBucket: "running" }),
     ];
 
-    const groups = buildStatusGroups(workspaces, emptyProjectNames);
+    const groups = buildStatusGroups(workspaces, emptyProjectNames, i18n.t);
 
     expect(groups.map((g) => g.bucket)).toEqual(["running", "done"]);
   });
@@ -99,7 +100,7 @@ describe("buildStatusGroups", () => {
       }),
     ];
 
-    const groups = buildStatusGroups(workspaces, emptyProjectNames);
+    const groups = buildStatusGroups(workspaces, emptyProjectNames, i18n.t);
 
     expect(groups[0]?.rows.map((r) => r.workspaceKey)).toEqual(["srv:new", "srv:mid", "srv:old"]);
   });
@@ -115,7 +116,7 @@ describe("buildStatusGroups", () => {
       ws({ workspaceKey: "srv:null-b", statusBucket: "done", statusEnteredAt: null }),
     ];
 
-    const groups = buildStatusGroups(workspaces, emptyProjectNames);
+    const groups = buildStatusGroups(workspaces, emptyProjectNames, i18n.t);
 
     expect(groups[0]?.rows.map((r) => r.workspaceKey)).toEqual([
       "srv:ts",
@@ -151,13 +152,13 @@ describe("buildStatusGroups", () => {
       }),
     ];
 
-    const groups = buildStatusGroups(workspaces, projectNames);
+    const groups = buildStatusGroups(workspaces, projectNames, i18n.t);
 
     expect(groups[0]?.rows.map((r) => r.workspaceKey)).toEqual(["srv:2", "srv:3", "srv:1"]);
   });
 
   it("returns empty array for no workspaces", () => {
-    const groups = buildStatusGroups([], emptyProjectNames);
+    const groups = buildStatusGroups([], emptyProjectNames, i18n.t);
     expect(groups).toEqual([]);
   });
 
@@ -186,11 +187,11 @@ describe("buildStatusGroups", () => {
       ws({ workspaceKey: "srv:dn", statusBucket: "done", statusEnteredAt: null }),
     ];
 
-    const groups = buildStatusGroups(workspaces, emptyProjectNames);
+    const groups = buildStatusGroups(workspaces, emptyProjectNames, i18n.t);
 
     expect(groups.map((g) => g.bucket)).toEqual(STATUS_BUCKET_ORDER);
     expect(groups.map((g) => g.label)).toEqual(
-      STATUS_BUCKET_ORDER.map((b) => STATUS_BUCKET_LABELS[b]),
+      STATUS_BUCKET_ORDER.map((b) => getStatusBucketLabel(b, i18n.t)),
     );
     // Each group has exactly one row with the matching bucket
     for (const group of groups) {
@@ -234,5 +235,22 @@ describe("buildStatusShortcutIndex", () => {
   it("returns empty map for empty groups", () => {
     const index = buildStatusShortcutIndex([]);
     expect(index.size).toBe(0);
+  });
+});
+
+describe("getStatusBucketLabel", () => {
+  it("reads in the active app language", async () => {
+    await i18n.changeLanguage("fr");
+    try {
+      expect(STATUS_BUCKET_ORDER.map((bucket) => getStatusBucketLabel(bucket, i18n.t))).toEqual([
+        "Attend une réponse",
+        "Échec",
+        "À relire",
+        "En cours",
+        "Terminé",
+      ]);
+    } finally {
+      await i18n.changeLanguage("en");
+    }
   });
 });

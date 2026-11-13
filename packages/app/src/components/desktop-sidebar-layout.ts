@@ -1,5 +1,11 @@
+import { EXPLORER_WORKSPACE_MIN_WIDTH } from "@/components/explorer-sidebar-layout";
 import { SETTINGS_DESKTOP_SPLIT_MIN_WIDTH } from "@/constants/layout";
-import { MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH } from "@/stores/panel-store";
+import {
+  MAX_SIDEBAR_WIDTH,
+  MIN_SIDEBAR_WIDTH,
+  type LeftSidebarPresentation,
+} from "@/stores/panel-store";
+import type { DesktopDivisionLayout } from "@/window-layout";
 
 const MIN_DESKTOP_CENTER_WIDTH = 400;
 
@@ -9,13 +15,13 @@ export function resolveDesktopSidebarVisibility(input: {
   isMounted: boolean;
   isOpen: boolean;
   canShare: boolean;
+  divisionLayout?: DesktopDivisionLayout | null;
 }): boolean {
   return (
     input.chromeEnabled &&
     !input.isCompactLayout &&
     input.isMounted &&
-    input.isOpen &&
-    input.canShare
+    (input.divisionLayout != null || (input.isOpen && input.canShare))
   );
 }
 
@@ -77,8 +83,12 @@ export function resolveDesktopSidebarWidth(input: {
   });
 }
 
-export function resolveDesktopAppContentMinimum(input: { isSettingsRoute: boolean }): number {
-  return input.isSettingsRoute ? SETTINGS_DESKTOP_SPLIT_MIN_WIDTH : 0;
+export function resolveDesktopAppContentMinimum(input: {
+  isSettingsRoute: boolean;
+  explorerVisible?: boolean;
+}): number {
+  if (input.isSettingsRoute) return SETTINGS_DESKTOP_SPLIT_MIN_WIDTH;
+  return input.explorerVisible ? EXPLORER_WORKSPACE_MIN_WIDTH : 0;
 }
 
 export function canDesktopAppSidebarShare(input: {
@@ -94,4 +104,12 @@ export function canDesktopAppSidebarShare(input: {
       }) >=
     input.contentMinimumWidth
   );
+}
+
+export function resolveSidebarActivity(
+  visible: boolean,
+  compact: boolean,
+  mobileActive: boolean,
+): boolean {
+  return visible && (!compact || mobileActive);
 }

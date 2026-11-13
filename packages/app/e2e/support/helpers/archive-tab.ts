@@ -52,18 +52,18 @@ export interface IdleAgentSeedClient {
   ): Promise<{ status: string }>;
 }
 
-export async function createIdleAgent(
+async function seedIdleAgent(
   client: IdleAgentSeedClient,
   input: { cwd: string; workspaceId: string; title: string },
+  provider: {
+    provider: string;
+    model: string;
+    modeId: string;
+    featureValues?: Record<string, unknown>;
+  },
 ): Promise<ArchiveTabAgent> {
   const created = await client.createAgent({
-    provider: "opencode",
-    model: "opencode/gpt-5-nano",
-    // OpenCode has no "bypassPermissions" mode (that's Claude's). Use build with
-    // auto_accept for unattended full access — mode validation now rejects modes
-    // the provider doesn't define.
-    modeId: "build",
-    featureValues: { auto_accept: true },
+    ...provider,
     cwd: input.cwd,
     workspaceId: input.workspaceId,
     title: input.title,
@@ -82,6 +82,32 @@ export async function createIdleAgent(
     cwd: input.cwd,
     workspaceId: input.workspaceId,
   };
+}
+
+export async function createIdleAgent(
+  client: IdleAgentSeedClient,
+  input: { cwd: string; workspaceId: string; title: string },
+): Promise<ArchiveTabAgent> {
+  return seedIdleAgent(client, input, {
+    provider: "opencode",
+    model: "opencode/gpt-5-nano",
+    // OpenCode has no "bypassPermissions" mode (that's Claude's). Use build with
+    // auto_accept for unattended full access — mode validation now rejects modes
+    // the provider doesn't define.
+    modeId: "build",
+    featureValues: { auto_accept: true },
+  });
+}
+
+export async function createMockIdleAgent(
+  client: IdleAgentSeedClient,
+  input: { cwd: string; workspaceId: string; title: string },
+): Promise<ArchiveTabAgent> {
+  return seedIdleAgent(client, input, {
+    provider: "mock",
+    model: "e2e-fast-stream",
+    modeId: "load-test",
+  });
 }
 
 export async function archiveAgentFromDaemon(
@@ -193,6 +219,11 @@ export async function expectWorkspaceArchiveOutcome(
   await expectWorkspaceTabVisible(page, input.survivingAgentId);
 }
 
+export async function closeActiveAgentWithShortcut(page: Page, agentId: string): Promise<void> {
+  await page.keyboard.press("Alt+Shift+w");
+  await expectWorkspaceTabHidden(page, agentId);
+}
+
 export async function closeWorkspaceAgentTab(page: Page, agentId: string): Promise<void> {
   const closeButton = page.getByTestId(`workspace-agent-close-${agentId}`).filter({
     visible: true,
@@ -209,6 +240,10 @@ export async function expectArchivedAgentFocused(page: Page, agentId: string): P
   ).toBeVisible({
     timeout: 30_000,
   });
+}
+
+export async function unarchiveAgentFromConversation(page: Page): Promise<void> {
+  await page.getByRole("button", { name: "Unarchive", exact: true }).click();
 }
 
 export async function reloadWorkspace(page: Page, workspaceId: string): Promise<void> {

@@ -10,6 +10,88 @@ import {
 } from "./messages.js";
 
 describe("workspace message schemas", () => {
+  test("parses mark-unread request and response", () => {
+    expect(
+      SessionInboundMessageSchema.parse({
+        type: "workspace.mark_unread.request",
+        workspaceId: "workspace-1",
+        requestId: "req-mark-unread",
+      }),
+    ).toEqual({
+      type: "workspace.mark_unread.request",
+      workspaceId: "workspace-1",
+      requestId: "req-mark-unread",
+    });
+
+    expect(
+      SessionOutboundMessageSchema.parse({
+        type: "workspace.mark_unread.response",
+        payload: {
+          requestId: "req-mark-unread",
+          workspaceId: "workspace-1",
+          markedAgentId: "agent-1",
+          success: true,
+          error: null,
+        },
+      }),
+    ).toEqual({
+      type: "workspace.mark_unread.response",
+      payload: {
+        requestId: "req-mark-unread",
+        workspaceId: "workspace-1",
+        markedAgentId: "agent-1",
+        success: true,
+        error: null,
+      },
+    });
+  });
+
+  test("parses blocked setup status and the explicit setup run RPC", () => {
+    expect(
+      SessionInboundMessageSchema.parse({
+        type: "workspace.setup.run.request",
+        workspaceId: "workspace-fork",
+        requestId: "run-setup",
+      }),
+    ).toMatchObject({ type: "workspace.setup.run.request", workspaceId: "workspace-fork" });
+
+    expect(
+      SessionOutboundMessageSchema.parse({
+        type: "workspace_setup_progress",
+        payload: {
+          workspaceId: "workspace-fork",
+          status: "blocked",
+          detail: {
+            type: "worktree_setup",
+            worktreePath: "/repo/fork",
+            branchName: "fork",
+            log: "",
+            commands: [],
+          },
+          error: null,
+          blockedSource: {
+            kind: "change_request",
+            forge: "github",
+            number: 42,
+            headRepository: "contributor/paseo",
+          },
+        },
+      }),
+    ).toMatchObject({ payload: { status: "blocked", blockedSource: { number: 42 } } });
+
+    expect(
+      SessionOutboundMessageSchema.parse({
+        type: "workspace.setup.run.response",
+        payload: {
+          requestId: "run-setup",
+          workspaceId: "workspace-fork",
+          started: true,
+          error: null,
+        },
+      }),
+    ).toMatchObject({ type: "workspace.setup.run.response", payload: { started: true } });
+  });
+
   test("parses fetch_workspaces_request", () => {
     const parsed = SessionInboundMessageSchema.parse({
       type: "fetch_workspaces_request",
@@ -264,6 +346,7 @@ describe("workspace message schemas", () => {
 
     expect(request.type).toBe("fetch_recent_provider_sessions_request");
     expect(request.providers).toEqual(["my-claude"]);
+    expect(request.query).toBeUndefined();
     expect(response.payload).toEqual({
       requestId: "req-recent-provider-sessions",
       entries: [
@@ -279,6 +362,30 @@ describe("workspace message schemas", () => {
         },
       ],
     });
+  });
+
+  test("parses session import search requests and per-provider errors", () => {
+    const request = SessionInboundMessageSchema.parse({
+      type: "fetch_recent_provider_sessions_request",
+      requestId: "req-search-provider-sessions",
+      query: "invoice",
+    });
+    const response = SessionOutboundMessageSchema.parse({
+      type: "fetch_recent_provider_sessions_response",
+      payload: {
+        requestId: "req-search-provider-sessions",
+        entries: [],
+        providerErrors: [{ provider: "codex", message: "Codex listing timed out" }],
+      },
+    });
+
+    expect(request.query).toBe("invoice");
+    if (response.type !== "fetch_recent_provider_sessions_response") {
+      throw new Error("expected fetch_recent_provider_sessions_response");
+    }
+    expect(response.payload.providerErrors).toEqual([
+      { provider: "codex", message: "Codex listing timed out" },
+    ]);
   });
 
   test("parses fetch_recent_provider_sessions response with filteredAlreadyImportedCount", () => {
@@ -525,6 +632,26 @@ describe("workspace message schemas", () => {
         terminalId: null,
       },
     ]);
+  });
+
+  test("preserves informational workspace parentage in directory updates", () => {
+    const workspace = {
+      id: "child",
+      parentWorkspaceId: "parent",
+      projectId: "project",
+      projectDisplayName: "repo",
+      projectRootPath: "/repo",
+      projectKind: "git",
+      workspaceKind: "worktree",
+      name: "child",
+      status: "done",
+      activityAt: null,
+    };
+    expect(WorkspaceDescriptorPayloadSchema.parse(workspace).parentWorkspaceId).toBe("parent");
+    expect(
+      WorkspaceDescriptorPayloadSchema.parse({ ...workspace, parentWorkspaceId: undefined })
+        .parentWorkspaceId,
+    ).toBeUndefined();
   });
 
   test("parses legacy workspace descriptors without workspaceDirectory", () => {
@@ -1124,6 +1251,15 @@ describe("workspace message schemas", () => {
     expect(
       WorkspaceDescriptorPayloadSchema.parse({ ...baseWorkspace, forge: "gitlab" }).forge,
     ).toBe("gitlab");
+
+    // forgeWeb is optional: an old daemon omits it, a new daemon's value round-trips.
+    expect(WorkspaceDescriptorPayloadSchema.parse(baseWorkspace).forgeWeb).toBeUndefined();
+    expect(
+      WorkspaceDescriptorPayloadSchema.parse({
+        ...baseWorkspace,
+        forgeWeb: { host: "github.com", referenceRepository: "main-owner/repo" },
+      }).forgeWeb,
+    ).toEqual({ host: "github.com", referenceRepository: "main-owner/repo" });
   });
 
   test("workspace.create.request rejects old flat backing shape and accepts new source envelope", () => {

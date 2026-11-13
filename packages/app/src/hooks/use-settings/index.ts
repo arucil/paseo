@@ -17,31 +17,39 @@ import {
   DEFAULT_CLIENT_SETTINGS,
   DEFAULT_CODE_FONT_SIZE,
   DEFAULT_CONTENT_FONT_SIZE,
+  DEFAULT_CONTENT_MAX_WIDTH,
   DEFAULT_TERMINAL_SCROLLBACK_LINES,
   DEFAULT_THEME_PREFERENCE,
   DEFAULT_UI_BASE_FONT_SIZE,
   MAX_CODE_FONT_SIZE,
   MAX_CONTENT_FONT_SIZE,
+  MAX_CONTENT_MAX_WIDTH,
   MAX_TERMINAL_SCROLLBACK_LINES,
   MAX_UI_BASE_FONT_SIZE,
   MIN_CODE_FONT_SIZE,
   MIN_CONTENT_FONT_SIZE,
+  MIN_CONTENT_MAX_WIDTH,
   MIN_TERMINAL_SCROLLBACK_LINES,
   MIN_UI_BASE_FONT_SIZE,
   loadAppSettingsFromStorage as loadAppSettingsFromStoragePure,
   loadSettingsFromStorage as loadSettingsFromStoragePure,
   normalizeAppSettings,
   parseClampedFontSize,
+  parseContentMaxWidth,
   parseTerminalScrollbackLines,
+  resolveContentMaxWidth,
   sanitizeFontFamily,
   saveAppSettings as saveAppSettingsPure,
   type AppSettings,
+  type AppSettingsUpdate,
+  type ChatDisplay,
   type OpenInSidePanePreferences,
   type PullRequestOpenLocation,
   type DesktopSettingsBridge,
   type KeyValueStorage,
   type ReleaseChannel,
   type SendBehavior,
+  type SendShortcut,
   type ServiceUrlBehavior,
   type Settings,
   type SidebarWorkspaceTrailing,
@@ -55,23 +63,30 @@ export {
   DEFAULT_CLIENT_SETTINGS,
   DEFAULT_CODE_FONT_SIZE,
   DEFAULT_CONTENT_FONT_SIZE,
+  DEFAULT_CONTENT_MAX_WIDTH,
   DEFAULT_TERMINAL_SCROLLBACK_LINES,
   DEFAULT_THEME_PREFERENCE,
   DEFAULT_UI_BASE_FONT_SIZE,
   MAX_CODE_FONT_SIZE,
   MAX_CONTENT_FONT_SIZE,
+  MAX_CONTENT_MAX_WIDTH,
   MAX_TERMINAL_SCROLLBACK_LINES,
   MAX_UI_BASE_FONT_SIZE,
   MIN_CODE_FONT_SIZE,
   MIN_CONTENT_FONT_SIZE,
+  MIN_CONTENT_MAX_WIDTH,
   MIN_TERMINAL_SCROLLBACK_LINES,
   MIN_UI_BASE_FONT_SIZE,
   parseClampedFontSize,
+  parseContentMaxWidth,
   parseTerminalScrollbackLines,
+  resolveContentMaxWidth,
   sanitizeFontFamily,
 };
 export type {
   AppSettings,
+  AppSettingsUpdate,
+  ChatDisplay,
   AppLanguage,
   OpenInSidePanePreferences,
   PullRequestOpenLocation,
@@ -79,6 +94,7 @@ export type {
   KeyValueStorage,
   ReleaseChannel,
   SendBehavior,
+  SendShortcut,
   ServiceUrlBehavior,
   Settings,
   SettingsDeps,
@@ -116,7 +132,7 @@ export interface UseAppSettingsReturn {
   settings: AppSettings;
   isLoading: boolean;
   error: unknown;
-  updateSettings: (updates: Partial<AppSettings>) => Promise<void>;
+  updateSettings: (updates: AppSettingsUpdate) => Promise<void>;
   resetSettings: () => Promise<void>;
 }
 
@@ -140,7 +156,7 @@ export function useAppSettings(): UseAppSettingsReturn {
   });
 
   const updateSettings = useCallback(
-    async (updates: Partial<AppSettings>) => {
+    async (updates: AppSettingsUpdate) => {
       try {
         await saveAppSettings({ queryClient, updates });
       } catch (err) {
@@ -242,7 +258,7 @@ export async function persistAppSettings(updates: Partial<AppSettings>): Promise
 
 export async function saveAppSettings(input: {
   queryClient: QueryClient;
-  updates: Partial<AppSettings>;
+  updates: AppSettingsUpdate;
   deps?: SettingsDeps;
 }): Promise<void> {
   await saveAppSettingsPure({

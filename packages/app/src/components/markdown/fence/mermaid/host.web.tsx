@@ -1,103 +1,16 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Pressable, View, type TextStyle, type ViewStyle } from "react-native";
-import { Code, Workflow } from "lucide-react-native";
+import { useCallback, useMemo, useState } from "react";
+import { Pressable, View, type ViewStyle } from "react-native";
+import { Code, Maximize2, Workflow } from "lucide-react-native";
 import { useTranslation } from "react-i18next";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { HighlightedCodeBlock } from "@/components/highlighted-code-block";
 import { ZoomableViewport } from "@/components/zoomable-viewport";
 import type { Theme } from "@/styles/theme";
-import type { MarkdownFenceRendererProps } from "../types";
-import type { MermaidRenderRequest } from "./render-model";
-import { mermaidRuntimeHtml } from "./runtime/html.gen";
-import { parseMermaidRuntimeMessage, type MermaidRuntimeRenderMessage } from "./runtime/messages";
-import { MermaidRuntimeRequestDriver } from "./runtime/request-driver";
+import type { MarkdownFenceRendererProps } from "./types";
+import { MermaidFullscreenViewer } from "./fullscreen-viewer.web";
+import { MermaidIframeRuntime, type MermaidRenderedMessage } from "./iframe-runtime.web";
 import { useMermaidRenderModel } from "./use-render-model";
 import { getDiagramBoxStyle } from "./presentation";
-
-interface MermaidIframeRuntimeProps {
-  request: MermaidRenderRequest | null;
-  height: React.CSSProperties["height"];
-  onRendered: (message: {
-    revision: number;
-    source: string;
-    colorScheme: "light" | "dark";
-    height: number;
-    width: number;
-  }) => void;
-  onRenderFailed: (revision: number) => void;
-}
-
-function MermaidIframeRuntime({
-  request,
-  height,
-  onRendered,
-  onRenderFailed,
-}: MermaidIframeRuntimeProps) {
-  const iframeRef = useRef<HTMLIFrameElement | null>(null);
-  const driverRef = useRef<MermaidRuntimeRequestDriver | null>(null);
-  driverRef.current ??= new MermaidRuntimeRequestDriver();
-  const iframeStyle = useMemo<React.CSSProperties>(
-    () => ({
-      display: "block",
-      width: "100%",
-      height,
-      border: 0,
-      pointerEvents: "none",
-      background: "transparent",
-    }),
-    [height],
-  );
-
-  const sendRequest = useCallback((current: MermaidRenderRequest | null) => {
-    const target = iframeRef.current?.contentWindow;
-    if (!current || !target) return;
-    const message: MermaidRuntimeRenderMessage = {
-      type: "render",
-      revision: current.revision,
-      source: current.source,
-      colorScheme: current.colorScheme,
-      interactive: false,
-    };
-    target.postMessage(message, "*");
-  }, []);
-
-  useEffect(() => {
-    sendRequest(driverRef.current?.update(request) ?? null);
-  }, [request, sendRequest]);
-
-  useEffect(() => {
-    function receiveMessage(event: MessageEvent): void {
-      if (event.source !== iframeRef.current?.contentWindow) return;
-      const message = parseMermaidRuntimeMessage(event.data);
-      if (!message) return;
-      if (message.type === "bridgeReady") {
-        sendRequest(driverRef.current?.ready() ?? null);
-        return;
-      }
-      if (message.type === "renderError") {
-        onRenderFailed(message.revision);
-        sendRequest(driverRef.current?.settled(message.revision, false) ?? null);
-        return;
-      }
-      onRendered(message);
-      sendRequest(driverRef.current?.settled(message.revision, true) ?? null);
-    }
-    window.addEventListener("message", receiveMessage);
-    return () => window.removeEventListener("message", receiveMessage);
-  }, [onRenderFailed, onRendered, sendRequest]);
-
-  return (
-    <iframe
-      ref={iframeRef}
-      title=""
-      aria-hidden
-      sandbox="allow-scripts"
-      srcDoc={mermaidRuntimeHtml}
-      tabIndex={-1}
-      style={iframeStyle}
-    />
-  );
-}
 
 interface MermaidFenceHostImplProps extends MarkdownFenceRendererProps {
   colorScheme?: "light" | "dark";
@@ -118,16 +31,13 @@ function MermaidFenceHostImpl({
   });
   const [hasRuntimeContent, setHasRuntimeContent] = useState(false);
   const [showSource, setShowSource] = useState(false);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const showSourcePress = useCallback(() => setShowSource(true), []);
   const showDiagramPress = useCallback(() => setShowSource(false), []);
+  const openFullscreen = useCallback(() => setIsFullscreen(true), []);
+  const closeFullscreen = useCallback(() => setIsFullscreen(false), []);
   const handleRendered = useCallback(
-    (message: {
-      revision: number;
-      source: string;
-      colorScheme: "light" | "dark";
-      height: number;
-      width: number;
-    }) => {
+    (message: MermaidRenderedMessage) => {
       setHasRuntimeContent(true);
       rendered({
         revision: message.revision,
@@ -149,20 +59,21 @@ function MermaidFenceHostImpl({
         label: t("message.diagram.viewSource"),
         onPress: showSourcePress,
       },
+      {
+        icon: Maximize2,
+        label: t("message.diagram.fullscreen"),
+        onPress: openFullscreen,
+        testID: "mermaid-fullscreen",
+      },
     ],
-    [showSourcePress, t],
+    [openFullscreen, showSourcePress, t],
   );
-  const sourceView = useMemo(() => {
-    const { marginTop, marginBottom, marginVertical, ...sourceTextStyle } = textStyle;
-    const margins: ViewStyle = {
-      marginTop: marginTop ?? marginVertical,
-      marginBottom: marginBottom ?? marginVertical,
-    };
-    const text: TextStyle = sourceTextStyle;
-    return { container: [margins, sourceContainerStyle], text };
-  }, [textStyle]);
   const diagramStyle = useMemo(
-    () => [getDiagramBoxStyle(textStyle), containerStyle, { height: runtimeHeight }],
+    () => [
+      getDiagramBoxStyle(textStyle),
+      containerStyle,
+      { height: Math.min(runtimeHeight, MAX_PREVIEW_HEIGHT), minHeight: MIN_DIAGRAM_BOX_HEIGHT },
+    ],
     [runtimeHeight, textStyle],
   );
   const diagramSize = useMemo(
@@ -170,19 +81,17 @@ function MermaidFenceHostImpl({
     [visible],
   );
   const sourceVisible = !diagramVisible;
-  const sourceContainer = showSource ? sourceView.container : sourceContainerStyle;
-  const sourceTextStyle = showSource ? sourceView.text : textStyle;
   const viewportStyle = diagramVisible ? diagramStyle : measuringStyle;
 
   return (
     <>
       {sourceVisible ? (
-        <View style={sourceContainer}>
+        <View style={sourceContainerStyle}>
           <HighlightedCodeBlock
             code={code}
             language="mermaid"
             inheritedStyles={inheritedStyles}
-            textStyle={sourceTextStyle}
+            textStyle={textStyle}
           />
           {showSource && canShowDiagram ? (
             <Pressable
@@ -202,28 +111,54 @@ function MermaidFenceHostImpl({
           ) : null}
         </View>
       ) : null}
-      <ZoomableViewport
-        accessibilityLabel={t("message.diagram.diagram")}
-        actions={actions}
-        contentSize={diagramSize}
-        style={viewportStyle}
-        testID="mermaid-viewport"
-        wheelActivation="modifier"
-      >
-        <MermaidIframeRuntime
-          request={request}
-          height="100%"
-          onRendered={handleRendered}
-          onRenderFailed={renderFailed}
+      <div inert={!diagramVisible} style={boundaryStyle}>
+        <ZoomableViewport
+          accessibilityLabel={t("message.diagram.diagram")}
+          actions={actions}
+          contentSize={diagramSize}
+          style={viewportStyle}
+          testID="mermaid-viewport"
+          wheelActivation="modifier"
+        >
+          <MermaidIframeRuntime
+            request={request}
+            onRendered={handleRendered}
+            onRenderFailed={renderFailed}
+          />
+        </ZoomableViewport>
+      </div>
+      {isFullscreen && visible ? (
+        <MermaidFullscreenViewer
+          source={visible.source}
+          colorScheme={visible.colorScheme}
+          onClose={closeFullscreen}
         />
-      </ZoomableViewport>
+      ) : null}
     </>
   );
 }
 
 const MEASURING_SIZE = { width: 240, height: 240 };
+/**
+ * The toolbar overlays the top of the box (8px offset + 32px compact buttons) and the box clips
+ * with `overflow: hidden`, so a shorter box leaves the buttons half-clipped and unclickable.
+ */
+const MIN_DIAGRAM_BOX_HEIGHT = 56;
+const MAX_PREVIEW_HEIGHT = 480;
+const boundaryStyle: React.CSSProperties = { display: "contents" };
 const sourceContainerStyle: ViewStyle = { position: "relative" };
-const containerStyle: ViewStyle = { overflow: "hidden", position: "relative" };
+/**
+ * The viewport's own root is `flex: 1`, so as a flex item it has `flex-basis: 0%` and that basis
+ * replaces the height below. In the markdown column there is no free space to grow into, so the
+ * box collapses and the diagram is scaled down to fit a couple of pixels. Size it from the height.
+ */
+const containerStyle: ViewStyle = {
+  flexBasis: "auto",
+  flexGrow: 0,
+  flexShrink: 0,
+  overflow: "hidden",
+  position: "relative",
+};
 const measuringStyle: ViewStyle = {
   position: "absolute",
   left: 0,

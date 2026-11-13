@@ -1,7 +1,8 @@
+import { mapCustomMessageToToolCall } from "../custom-message.js";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve as resolvePath } from "node:path";
+import { basename, join, resolve as resolvePath } from "node:path";
 import type { Logger } from "pino";
 import stripAnsi from "strip-ansi";
 import { z } from "zod";
@@ -9,7 +10,7 @@ import { z } from "zod";
 import {
   type AgentCapabilityFlags,
   type AgentClient,
-  type AgentFeature,
+  type AgentDraftControls,
   type AgentLaunchContext,
   type AgentMetadata,
   type AgentMode,
@@ -21,22 +22,25 @@ import {
   type AgentPersistenceHandle,
   type AgentPromptInput,
   type AgentProvider,
+  type AgentResumeSessionOptions,
   type AgentRunOptions,
   type AgentRunResult,
   type AgentRuntimeInfo,
+  type AgentSelectOption,
   type AgentSession,
   type AgentSessionConfig,
   type AgentSlashCommand,
   type AgentSlashCommandKind,
   type AgentStreamEvent,
   type FetchCatalogOptions,
+  type SteerActiveTurnOptions,
+  type SteerResult,
   type ImportableProviderSession,
   type ImportProviderSessionContext,
   type ImportProviderSessionInput,
   type ListImportableSessionsOptions,
   type ProviderCatalog,
   type ProviderRefreshContext,
-  type ToolCallDetail,
 } from "../../agent-sdk-types.js";
 import { importSessionFromPersistence } from "../../provider-session-import.js";
 import { runProviderRefreshActivity } from "../../provider-refresh-deadline.js";
@@ -61,10 +65,24 @@ import {
   streamPiHistory,
   type PiCapturedUserMessageEntry,
 } from "./history-mapper.js";
-import { materializeProviderImage } from "../provider-image-output.js";
+import {
+  materializeProviderImage,
+  renderProviderImageOutputAsAssistantMarkdown,
+  type ProviderImageOutput,
+} from "../provider-image-output.js";
 import { PiCliRuntime } from "./cli-runtime.js";
+import {
+  createPiExtensionHost,
+  piExtensionRuntimeBridge,
+  type PiExtensionEventOutput,
+} from "./extensions/index.js";
+import { resolveResumeProcessCwd } from "../resume-process-cwd.js";
 import { revertPiConversation } from "./rewind.js";
-import { listPiImportableSessions, readPiImportSessionConfig } from "./session-descriptor.js";
+import {
+  copyPiSessionFileWithCwd,
+  listPiImportableSessions,
+  readPiImportSessionConfig,
+} from "./session-descriptor.js";
 import type { PiRuntime, PiRuntimeSession, PiStartSessionInput } from "./runtime.js";
 import type {
   PiAgentSessionEvent,
@@ -81,7 +99,7 @@ import {
   mapToolDetail,
   parseToolArgs,
   parseToolResult,
-  resolveToolCallName,
+  splitPiToolResultImages,
   type PiToolResult,
   type PiTrackedToolCall,
 } from "./tool-call-mapper.js";
@@ -91,25 +109,21 @@ const DEFAULT_PI_THINKING_LEVEL: PiThinkingLevel = "medium";
 const PI_BINARY_COMMAND = process.env.PI_COMMAND ?? process.env.PI_ACP_PI_COMMAND ?? "pi";
 const PASEO_PI_TREE_EXTENSION_COMMAND = "paseo_tree";
 const PASEO_PI_CAPTURE_EXTENSION_COMMAND = "paseo_capture_entries";
+const PASEO_PI_REWIND_ENTRY_TYPE = "paseo_rewind";
 const PASEO_PI_ENTRY_CAPTURE_MARKER = "PASEO_ENTRY_CAPTURE";
 const PASEO_PI_SUBMITTED_USER_ENTRY_MARKER = "PASEO_SUBMITTED_USER_ENTRY";
 const PASEO_PI_COMMAND_RESULT_MARKER = "PASEO_COMMAND_RESULT";
 const DEFAULT_PI_EXTENSION_RESULT_TIMEOUT_MS = 30_000;
 const DEFAULT_PI_RPC_TIMEOUT_MS = 60_000;
 const QUESTION_RESPONSE_HEADER = "Response";
-const QUESTION_COMMENT_HEADER = "Comment";
-const PI_ASK_USER_FREEFORM_SENTINEL = "✏️ Type custom response...";
-const COMBINED_ASK_USER_METADATA = "ask_user_select_optional_comment";
 
-export const PiProviderParamsSchema = z
+export const PiProviderOptionsSchema = z
   .object({
     sessionDir: z.string().min(1).optional(),
     rpcTimeoutMs: z.number().int().positive().default(DEFAULT_PI_RPC_TIMEOUT_MS),
     extensionTimeoutMs: z.number().int().positive().default(DEFAULT_PI_EXTENSION_RESULT_TIMEOUT_MS),
   })
   .strict();
-
-type PiProviderParams = z.infer<typeof PiProviderParamsSchema>;
 
 const PI_HANDLED_BUILTIN_SLASH_COMMANDS: AgentSlashCommand[] = [
   {
@@ -169,12 +183,11 @@ const PI_THINKING_OPTIONS: ReadonlyArray<{
   id: PiThinkingLevel;
   label: string;
   description: string;
-  isDefault?: boolean;
 }> = [
   { id: "off", label: "Off", description: "No extra reasoning" },
   { id: "minimal", label: "Minimal", description: "Light reasoning" },
   { id: "low", label: "Low", description: "Faster reasoning" },
-  { id: "medium", label: "Medium", description: "Balanced reasoning", isDefault: true },
+  { id: "medium", label: "Medium", description: "Balanced reasoning" },
   { id: "high", label: "High", description: "Deeper reasoning" },
   { id: "xhigh", label: "XHigh", description: "Very deep reasoning" },
   { id: "max", label: "Max", description: "Extreme reasoning" },
@@ -183,7 +196,6 @@ const PI_THINKING_OPTIONS: ReadonlyArray<{
 export interface PiRpcAgentClientOptions {
   logger: Logger;
   runtimeSettings?: ProviderRuntimeSettings;
-  providerParams?: unknown;
   runtime?: PiRuntime;
   usagePollScheduler?: PiUsagePollScheduler;
 }
@@ -218,13 +230,30 @@ interface StartTurnResult {
   turnId: string;
 }
 
+interface PiPendingSteerSubmission {
+  text: string;
+  clientMessageId: string | null;
+}
+
+// COMPAT(piSteerFallback): added in v0.5.0, remove after 2027-03-01 once the pi floor
+// supports the steer RPC. Older binaries answer with "Unknown command: steer".
+function isPiDefinitiveSteerRejection(error: unknown): boolean {
+  return toDiagnosticErrorMessage(error) === "Unknown command: steer";
+}
+
+function isPiMissingClearQueueRpc(error: unknown): boolean {
+  return toDiagnosticErrorMessage(error) === "Unknown command: clear_queue";
+}
+
 interface PiRpcAgentSessionOptions {
   runtimeSession: PiRuntimeSession;
   config: AgentSessionConfig;
   initialState: PiSessionState;
   capabilities: AgentCapabilityFlags;
   currentModeId?: string | null;
+  persistedSessionFile?: string;
   cleanup?: () => void;
+  closeAfterHistory?: boolean;
   extensionTimeoutMs?: number;
   logger: Logger;
   usagePollScheduler?: PiUsagePollScheduler;
@@ -244,13 +273,17 @@ interface PiMcpServerConfig {
   env?: Record<string, string>;
   url?: string;
   headers?: Record<string, string>;
-  auth?: false;
-  oauth?: false;
 }
 
-interface PiMcpConfigFile {
-  path: string;
-  cleanup: () => void;
+// Pi's built-in MCP extension takes servers from Paseo's extension; pi-mcp-adapter replaces it
+// and takes them from a --mcp-config file.
+type PiMcpInjection =
+  | { kind: "builtin"; servers: Record<string, PiMcpServerConfig> }
+  | { kind: "adapter"; configFile: PiTempFile };
+
+interface PiPaseoExtensionOptions {
+  systemPrompt?: string;
+  mcpServers?: Record<string, PiMcpServerConfig>;
 }
 
 interface PiTempFile {
@@ -268,22 +301,9 @@ interface PendingExtensionResult {
   timer: NodeJS.Timeout;
 }
 
-interface ActiveAskUserDialog {
-  allowComment: boolean;
-  allowFreeform: boolean;
-  allowMultiple: boolean;
-}
-
-interface PendingCombinedAskUserResponse {
-  comment: string;
-  freeform: string | null;
-}
-
 interface ExtensionUiMappingOptions {
   provider?: AgentProvider;
   label?: string;
-  combineOptionalComment?: boolean;
-  allowFreeform?: boolean;
 }
 
 interface PiSlashCommandInvocation {
@@ -356,28 +376,13 @@ function parseAutoCompactMode(value: string | undefined): AutoCompactMode {
   return "unknown";
 }
 
-function mapThinkingOption(option: (typeof PI_THINKING_OPTIONS)[number]) {
-  const mappedOption = {
-    id: option.id,
-    label: option.label,
-    description: option.description,
-  };
-  if (option.isDefault) {
-    return {
-      ...mappedOption,
-      isDefault: true,
-    };
-  }
-  return mappedOption;
-}
-
 function piModelSupportsImageInput(model: PiModel | null | undefined): boolean {
   return model?.input?.includes("image") === true;
 }
 
-function renderTextOnlyImageHint(image: { data: string; mimeType: string }): string {
+async function renderTextOnlyImageHint(image: { data: string; mimeType: string }): Promise<string> {
   try {
-    const materialized = materializeProviderImage({
+    const materialized = await materializeProviderImage({
       data: image.data,
       mimeType: image.mimeType,
     });
@@ -387,10 +392,10 @@ function renderTextOnlyImageHint(image: { data: string; mimeType: string }): str
   }
 }
 
-function convertPromptInput(
+async function convertPromptInput(
   prompt: AgentPromptInput,
   options: { model: PiModel | null | undefined },
-): PiPromptPayload {
+): Promise<PiPromptPayload> {
   if (typeof prompt === "string") {
     return { text: prompt };
   }
@@ -413,7 +418,7 @@ function convertPromptInput(
           mimeType: block.mimeType,
         });
       } else {
-        textParts.push(renderTextOnlyImageHint(block));
+        textParts.push(await renderTextOnlyImageHint(block));
       }
       continue;
     }
@@ -495,18 +500,18 @@ function buildResumeConfig(
 
 function buildResumeStartInput(input: {
   resumeConfig: PiResumeConfig;
+  processCwd: string;
   sessionFile: string;
   launchContext: AgentLaunchContext | undefined;
-  mcpConfig: PiMcpConfigFile | null;
+  mcpConfigFile: PiTempFile | null;
   paseoExtension: PiTempFile | null;
 }): PiStartSessionInput {
   return {
-    cwd: input.resumeConfig.cwd,
+    cwd: input.processCwd,
     env: input.launchContext?.env,
     session: input.sessionFile,
-    model: input.resumeConfig.model,
     thinkingOptionId: normalizePiThinkingOption(input.resumeConfig.thinkingOptionId) ?? undefined,
-    mcpConfigPath: input.mcpConfig?.path,
+    mcpConfigPath: input.mcpConfigFile?.path,
     extensionPaths: input.paseoExtension ? [input.paseoExtension.path] : undefined,
   };
 }
@@ -523,9 +528,34 @@ function toPiMcpConfig(config: McpServerConfig): PiMcpServerConfig {
   return {
     url: config.url,
     ...(config.headers ? { headers: config.headers } : {}),
-    auth: false,
-    oauth: false,
   };
+}
+
+function toPiMcpAdapterConfig(
+  config: McpServerConfig,
+): PiMcpServerConfig & { auth?: false; oauth?: false } {
+  const piConfig = toPiMcpConfig(config);
+  return config.type === "stdio" ? piConfig : { ...piConfig, auth: false, oauth: false };
+}
+
+function toPiBuiltinMcpServers(
+  servers: Record<string, McpServerConfig>,
+): Record<string, PiMcpServerConfig> {
+  const piServers: Record<string, PiMcpServerConfig> = {};
+  for (const [name, config] of Object.entries(servers)) {
+    if (!/^[A-Za-z0-9_-]+$/.test(name)) {
+      throw new Error(
+        `Pi's built-in MCP cannot register server "${name}": names may only contain letters, digits, "_", and "-".`,
+      );
+    }
+    if (config.type === "sse") {
+      throw new Error(
+        `Pi's built-in MCP cannot register SSE server "${name}": use streamable HTTP or load pi-mcp-adapter.`,
+      );
+    }
+    piServers[name] = toPiMcpConfig(config);
+  }
+  return piServers;
 }
 
 function resolvePiAgentDir(env: Record<string, string> | undefined): string {
@@ -568,7 +598,7 @@ function createPiMcpConfigFile(
   options?: {
     piGlobalConfigEnv?: Record<string, string>;
   },
-): PiMcpConfigFile {
+): PiTempFile {
   const globalConfig = options?.piGlobalConfigEnv
     ? readPiGlobalMcpConfig(options.piGlobalConfigEnv)
     : {};
@@ -580,7 +610,7 @@ function createPiMcpConfigFile(
   }
   const mcpServers: Record<string, unknown> = { ...configuredServers };
   for (const [name, serverConfig] of Object.entries(servers)) {
-    mcpServers[name] = toPiMcpConfig(serverConfig);
+    mcpServers[name] = toPiMcpAdapterConfig(serverConfig);
   }
 
   const dir = mkdtempSync(join(tmpdir(), "paseo-pi-mcp-"));
@@ -597,7 +627,23 @@ function createPiMcpConfigFile(
   };
 }
 
-function createPiPaseoExtensionFile(systemPrompt?: string): PiTempFile {
+async function createPiSessionCopy(sessionFile: string, cwd: string): Promise<PiTempFile> {
+  const dir = mkdtempSync(join(tmpdir(), "paseo-pi-session-"));
+  const cleanup = () => rmSync(dir, { recursive: true, force: true });
+  const filePath = join(dir, basename(sessionFile));
+  try {
+    await copyPiSessionFileWithCwd({ sourceFile: sessionFile, targetFile: filePath, cwd });
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
+  return { path: filePath, cleanup };
+}
+
+function createPiPaseoExtensionFile({
+  systemPrompt,
+  mcpServers = {},
+}: PiPaseoExtensionOptions): PiTempFile {
   const dir = mkdtempSync(join(tmpdir(), "paseo-pi-extension-"));
   const filePath = join(dir, "paseo-integration.mjs");
   writeFileSync(
@@ -620,9 +666,8 @@ function createPiPaseoExtensionFile(systemPrompt?: string): PiTempFile {
 	    .join("\\n\\n");
 	}
 
-	function getCapturedUserEntries(ctx) {
-	  return ctx.sessionManager
-	    .getEntries()
+	function toCapturedUserEntries(entries) {
+	  return entries
 	    .filter((entry) => entry.type === "message" && entry.message?.role === "user")
 	    .map(toCapturedUserEntry);
 	}
@@ -638,7 +683,12 @@ function createPiPaseoExtensionFile(systemPrompt?: string): PiTempFile {
 	function emitEntryCapture(ctx, reason, requestId) {
 	  ctx.ui.notify(
 	    "${PASEO_PI_ENTRY_CAPTURE_MARKER} " +
-	      JSON.stringify({ reason, requestId, entries: getCapturedUserEntries(ctx) }),
+	      JSON.stringify({
+	        reason,
+	        requestId,
+	        // Rewind targets: rows can still show entries that a rewind or compaction left off the branch.
+	        treeEntries: toCapturedUserEntries(ctx.sessionManager.getEntries()),
+	      }),
 	    "info",
 	  );
 	}
@@ -651,7 +701,11 @@ function createPiPaseoExtensionFile(systemPrompt?: string): PiTempFile {
 	}
 
 	export default function paseoIntegration(pi) {
+	  for (const [name, config] of Object.entries(${JSON.stringify(mcpServers)})) {
+	    pi.registerMcpServer(name, config);
+	  }
 	  const submittedUserMessages = [];
+	  ${piExtensionRuntimeBridge}
 
 	  function emitSubmittedUserEntries(ctx) {
 	    const entries = ctx.sessionManager.getEntries();
@@ -718,6 +772,8 @@ function createPiPaseoExtensionFile(systemPrompt?: string): PiTempFile {
 	      const payload = decodePayload(args.trim());
 	      try {
 	        const result = await ctx.navigateTree(payload.targetId, { summarize: false });
+	        // Pi reopens a session at its last entry, so record the rewind on the new branch to keep it.
+	        pi.appendEntry("${PASEO_PI_REWIND_ENTRY_TYPE}", { targetId: payload.targetId });
 	        emitEntryCapture(ctx, "tree_navigation");
 	        emitCommandResult(ctx, payload.requestId, { ok: true, result });
 	      } catch (error) {
@@ -729,7 +785,8 @@ function createPiPaseoExtensionFile(systemPrompt?: string): PiTempFile {
 	  });
 	}
 `.trimStart(),
-    "utf8",
+    // MCP server headers and env can carry credentials.
+    { encoding: "utf8", mode: 0o600 },
   );
   return {
     path: filePath,
@@ -759,6 +816,14 @@ function isPiMcpAdapterCommand(command: PiRpcSlashCommand): boolean {
   return JSON.stringify(command.sourceInfo).includes("pi-mcp-adapter");
 }
 
+function isPiBuiltinMcpCommand(command: PiRpcSlashCommand): boolean {
+  return (
+    command.source === "extension" &&
+    command.name === "mcp" &&
+    command.sourceInfo?.path === "builtin:mcp"
+  );
+}
+
 function withPiCapabilities(supportsMcpServers: boolean): AgentCapabilityFlags {
   return {
     ...PI_CAPABILITIES,
@@ -772,14 +837,6 @@ function isPiRequestAbortError(error: unknown): boolean {
   }
 
   return /\brequest was aborted\b|\babort(ed)?\b/i.test(toDiagnosticErrorMessage(error));
-}
-
-function resolveThinkingOptionId(
-  cachedThinkingOptionId: string | null,
-  sessionThinkingLevel: PiThinkingLevel,
-): PiThinkingLevel | null {
-  const currentThinking = cachedThinkingOptionId ?? sessionThinkingLevel;
-  return normalizePiThinkingOption(currentThinking);
 }
 
 function modelToId(model: PiModel | null | undefined): string | null {
@@ -838,6 +895,13 @@ function optionalString(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
+function toNotificationLevel(value: unknown): "info" | "warning" | "error" {
+  if (value === "info" || value === "warning" || value === "error") {
+    return value;
+  }
+  return "info";
+}
+
 function parseExtensionMarkerPayload(
   message: string,
   marker: string,
@@ -878,21 +942,6 @@ function parseCapturedEntries(value: unknown): PiCapturedEntry[] {
   });
 }
 
-function optionalBoolean(value: unknown): boolean | undefined {
-  return typeof value === "boolean" ? value : undefined;
-}
-
-function readActiveAskUserDialog(toolName: string, args: unknown): ActiveAskUserDialog | null {
-  if (toolName !== "ask_user" || !isRecord(args)) {
-    return null;
-  }
-  return {
-    allowComment: optionalBoolean(args.allowComment) ?? false,
-    allowFreeform: optionalBoolean(args.allowFreeform) ?? true,
-    allowMultiple: optionalBoolean(args.allowMultiple) ?? false,
-  };
-}
-
 function isOptionalInputPlaceholder(placeholder: string | undefined): boolean {
   return /\boptional\b|\bskip\b/i.test(placeholder ?? "");
 }
@@ -913,10 +962,6 @@ function readStringArray(value: unknown): string[] {
     : [];
 }
 
-function isPiAskUserFreeformOption(option: string): boolean {
-  return option === PI_ASK_USER_FREEFORM_SENTINEL;
-}
-
 function mapExtensionUiRequestToPermission(
   event: Extract<PiRuntimeEvent, { type: "extension_ui_request" }>,
   options: ExtensionUiMappingOptions = {},
@@ -926,15 +971,6 @@ function mapExtensionUiRequestToPermission(
   switch (event.method) {
     case "select": {
       const selectOptions = readStringArray(event.options);
-      if (options.combineOptionalComment) {
-        return buildCombinedAskUserQuestionPermission(event, {
-          provider,
-          label,
-          question: optionalString(event.title) ?? "Select an option",
-          options: selectOptions,
-          allowFreeform: options.allowFreeform === true,
-        });
-      }
       return buildExtensionUiQuestionPermission(event, {
         provider,
         label,
@@ -994,6 +1030,8 @@ function isProcessExitEvent(
 
 function isPiAgentSessionEvent(event: PiRuntimeEvent): event is PiAgentSessionEvent {
   switch (event.type) {
+    case "thinking_level_changed":
+      return typeof event.level === "string" && normalizePiThinkingOption(event.level) !== null;
     case "agent_start":
     case "turn_start":
     case "message_start":
@@ -1052,63 +1090,6 @@ function buildExtensionUiQuestionPermission(
   };
 }
 
-function buildCombinedAskUserQuestionPermission(
-  event: Extract<PiRuntimeEvent, { type: "extension_ui_request" }>,
-  input: {
-    provider: AgentProvider;
-    label: string;
-    question: string;
-    options: string[];
-    allowFreeform: boolean;
-  },
-): AgentPermissionRequest {
-  const visibleOptions = input.options.filter((option) => !isPiAskUserFreeformOption(option));
-  const allowOther = input.allowFreeform || visibleOptions.length !== input.options.length;
-  return {
-    id: event.id,
-    provider: input.provider,
-    name: `${input.label} ask_user`,
-    kind: "question",
-    title: input.question,
-    input: {
-      questions: [
-        {
-          question: input.question,
-          header: QUESTION_RESPONSE_HEADER,
-          options: visibleOptions.map((label) => ({ label })),
-          multiSelect: false,
-          ...(allowOther ? { allowOther: true } : {}),
-        },
-        {
-          question: "Optional comment",
-          header: QUESTION_COMMENT_HEADER,
-          options: [],
-          multiSelect: false,
-          placeholder: "Optional comment (press Enter to skip)...",
-          allowEmpty: true,
-        },
-      ],
-    },
-    metadata: {
-      extensionUiMethod: event.method,
-      answerHeader: QUESTION_RESPONSE_HEADER,
-      commentHeader: QUESTION_COMMENT_HEADER,
-      combinedAskUser: COMBINED_ASK_USER_METADATA,
-      selectOptions: visibleOptions,
-      ...(allowOther ? { freeformSentinel: PI_ASK_USER_FREEFORM_SENTINEL } : {}),
-    },
-  };
-}
-
-function permissionAnswer(input: AgentMetadata | undefined, header: string): string | null {
-  const answers = isRecord(input?.answers) ? input.answers : null;
-  if (!answers) {
-    return null;
-  }
-  const answer = answers[header];
-  return typeof answer === "string" ? answer : null;
-}
-
 function firstPermissionAnswer(input: AgentMetadata | undefined): string | null {
   const answers = isRecord(input?.answers) ? input.answers : null;
   if (!answers) {
@@ -1116,39 +1097,6 @@ function firstPermissionAnswer(input: AgentMetadata | undefined): string | null 
   }
   const first = Object.values(answers).find((value) => typeof value === "string");
   return typeof first === "string" ? first : null;
-}
-
-function isCombinedAskUserPermission(request: AgentPermissionRequest): boolean {
-  return request.metadata?.combinedAskUser === COMBINED_ASK_USER_METADATA;
-}
-
-function buildCombinedAskUserSelectionResponse(
-  request: AgentPermissionRequest,
-  response: AgentPermissionResponse,
-): {
-  uiResponse: { value?: string; cancelled?: boolean };
-  pendingResponse: PendingCombinedAskUserResponse | null;
-} {
-  if (response.behavior === "deny") {
-    return { uiResponse: { cancelled: true }, pendingResponse: null };
-  }
-
-  const answer = permissionAnswer(response.updatedInput, QUESTION_RESPONSE_HEADER);
-  if (answer === null) {
-    return { uiResponse: { cancelled: true }, pendingResponse: null };
-  }
-
-  const selectOptions = readStringArray(request.metadata?.selectOptions);
-  const freeformSentinel = optionalString(request.metadata?.freeformSentinel);
-  const isFreeform = Boolean(freeformSentinel) && !selectOptions.includes(answer);
-  const comment = permissionAnswer(response.updatedInput, QUESTION_COMMENT_HEADER) ?? "";
-  return {
-    uiResponse: { value: isFreeform ? freeformSentinel : answer },
-    pendingResponse: {
-      comment,
-      freeform: isFreeform ? answer : null,
-    },
-  };
 }
 
 function buildExtensionUiResponse(
@@ -1171,7 +1119,50 @@ function buildExtensionUiResponse(
   return { value: answer };
 }
 
+function resolvePiThinkingConfig(
+  model: PiModel,
+): Pick<AgentModelDefinition, "thinkingOptions" | "defaultThinkingOptionId"> {
+  if (!model.reasoning) {
+    return { thinkingOptions: undefined, defaultThinkingOptionId: undefined };
+  }
+
+  const supportedOptions = PI_THINKING_OPTIONS.filter((option) => {
+    const mapped = model.thinkingLevelMap?.[option.id];
+    if (mapped === null) {
+      return false;
+    }
+    if (option.id === "xhigh" || option.id === "max") {
+      return mapped !== undefined;
+    }
+    return true;
+  });
+  const defaultIndex = PI_THINKING_OPTIONS.findIndex(
+    (option) => option.id === DEFAULT_PI_THINKING_LEVEL,
+  );
+  // Pi clamps upward first, then falls back to the highest remaining lower level.
+  const higherDefault = supportedOptions.find(
+    (option) => PI_THINKING_OPTIONS.indexOf(option) >= defaultIndex,
+  );
+  const defaultOption = higherDefault ?? supportedOptions.at(-1);
+  const defaultThinkingOptionId = defaultOption?.id ?? "off";
+  return {
+    thinkingOptions: supportedOptions.map((option) => {
+      const mappedOption: AgentSelectOption = {
+        id: option.id,
+        label: option.label,
+        description: option.description,
+      };
+      if (option.id === defaultThinkingOptionId) {
+        mappedOption.isDefault = true;
+      }
+      return mappedOption;
+    }),
+    defaultThinkingOptionId,
+  };
+}
+
 function mapPiModel(model: PiModel, provider: AgentProvider): AgentModelDefinition {
+  const { thinkingOptions, defaultThinkingOptionId } = resolvePiThinkingConfig(model);
   return {
     provider,
     id: `${model.provider}/${model.id}`,
@@ -1181,8 +1172,8 @@ function mapPiModel(model: PiModel, provider: AgentProvider): AgentModelDefiniti
       provider: model.provider,
       modelId: model.id,
     },
-    thinkingOptions: model.reasoning ? PI_THINKING_OPTIONS.map(mapThinkingOption) : undefined,
-    defaultThinkingOptionId: model.reasoning ? DEFAULT_PI_THINKING_LEVEL : undefined,
+    thinkingOptions,
+    defaultThinkingOptionId,
   };
 }
 
@@ -1207,8 +1198,7 @@ export class PiRpcAgentSession implements AgentSession {
   private readonly subscribers = new Set<(event: AgentStreamEvent) => void>();
   private readonly activeToolCalls = new Map<string, PiTrackedToolCall>();
   private readonly pendingExtensionUiRequests = new Map<string, AgentPermissionRequest>();
-  private activeAskUserDialog: ActiveAskUserDialog | null = null;
-  private pendingCombinedAskUserResponse: PendingCombinedAskUserResponse | null = null;
+  private readonly extensionHost: ReturnType<typeof createPiExtensionHost>;
   private activeTurnId: string | null = null;
   private activeClientMessageId: string | null = null;
   private activeAssistantMessageId: string | null = null;
@@ -1219,11 +1209,11 @@ export class PiRpcAgentSession implements AgentSession {
   private readonly pendingNoTurnOutputs: Array<{ turnId: string; message: string }> = [];
   private activePromptRequestId: string | null = null;
   private readonly pendingPromptResults = new Map<string, boolean>();
-  private lastKnownThinkingOptionId: string | null;
+  private readonly pendingSteerSubmissions: PiPendingSteerSubmission[] = [];
   currentLeafOverrideId: string | null | undefined;
-  private readonly capturedUserEntries: PiCapturedEntry[] = [];
-  private readonly capturedUserEntriesById = new Map<string, PiCapturedEntry>();
+  private readonly treeUserEntriesById = new Map<string, PiCapturedEntry>();
   private readonly pendingExtensionResults = new Map<string, PendingExtensionResult>();
+  private compactionPromise: Promise<void> | null = null;
   private outOfBandCompactionEmit: ((event: AgentStreamEvent) => void) | null = null;
   private outOfBandCompactionStarted = false;
   private outOfBandCompactionCompleted = false;
@@ -1233,26 +1223,44 @@ export class PiRpcAgentSession implements AgentSession {
   private readonly logger: Logger;
   private readonly usagePoller: PiUsagePoller;
   private closed = false;
-  // Pi reports an aborted OpenAI Responses stream before the abort RPC resolves.
-  // Keep the turn active until that RPC acknowledges the user-requested cancellation.
-  private interruptingTurnId: string | null = null;
-  private lastInterruptedTurnId: string | null = null;
-  private interruptedTerminalError: { turnId: string; error: string } | null = null;
+  private runtimeDead = false;
+  private readonly closeController = new AbortController();
+  private readonly pendingExtensionHydrations = new Set<Promise<void>>();
+  private pendingOutput: Promise<void> | null = null;
+  // Pi publishes the terminal before acknowledging abort. Autonomous runs have no
+  // turn ID; retain their errors too until the cancellation request settles.
+  private interruptingTurn: { turnId: string | undefined; error: string | null } | null = null;
+
+  private readonly usageSessionKey = randomUUID();
+
+  usageSession() {
+    const env = this.runtimeSession.environment;
+    if (this.closed) return null;
+    return {
+      provider: "pi",
+      model: modelToId(this.state.model) ?? undefined,
+      env,
+      sessionKey: this.usageSessionKey,
+    };
+  }
 
   constructor(options: PiRpcAgentSessionOptions) {
     this.runtimeSession = options.runtimeSession;
     this.config = options.config;
     this.state = options.initialState;
+    this.config.thinkingOptionId = this.state.thinkingLevel;
     this.capabilities = options.capabilities;
     this.provider = PI_PROVIDER;
     this.currentModeId = options.currentModeId ?? null;
+    this.persistedSessionFile = options.persistedSessionFile;
     this.cleanup = options.cleanup;
-    this.lastKnownThinkingOptionId =
-      normalizePiThinkingOption(options.config.thinkingOptionId) ??
-      this.state.thinkingLevel ??
-      null;
+    this.closeAfterHistory = options.closeAfterHistory ?? false;
     this.extensionTimeoutMs = options.extensionTimeoutMs ?? DEFAULT_PI_EXTENSION_RESULT_TIMEOUT_MS;
     this.logger = options.logger;
+    this.extensionHost = createPiExtensionHost(this.logger);
+    this.extensionHost.follow((event) => {
+      if (!this.closeController.signal.aborted) this.emit(event);
+    });
     this.usagePoller = new PiUsagePoller({
       scheduler: options.usagePollScheduler,
       readStats: () => this.runtimeSession.getSessionStats(),
@@ -1276,7 +1284,9 @@ export class PiRpcAgentSession implements AgentSession {
 
   private readonly runtimeSession: PiRuntimeSession;
   private readonly config: AgentSessionConfig;
+  private readonly persistedSessionFile?: string;
   private readonly cleanup?: () => void;
+  private readonly closeAfterHistory: boolean;
   private readonly extensionTimeoutMs: number;
 
   get id(): string | null {
@@ -1296,27 +1306,41 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   async startTurn(prompt: AgentPromptInput, options?: AgentRunOptions): Promise<StartTurnResult> {
+    if (this.runtimeDead) {
+      throw new Error("Pi process exited. Reload agent before sending another message.");
+    }
     if (this.activeTurnId) {
       throw new Error("A Pi turn is already active");
     }
 
-    const payload = convertPromptInput(prompt, { model: this.state.model });
     const turnId = randomUUID();
     this.activeTurnId = turnId;
     this.usagePoller.startTurn();
-    this.lastInterruptedTurnId = null;
     this.activeClientMessageId = options?.clientMessageId ?? null;
     this.activeAssistantMessageId = null;
     this.activeTurnStarted = false;
     this.activeTurnStartedEmitted = false;
     this.pendingSettledMessages = null;
     this.activePromptRequestId = null;
+    this.pendingSteerSubmissions.length = 0;
     this.clearNoTurnBuffers();
+    const payload = await convertPromptInput(prompt, { model: this.state.model });
+    if (this.closed) throw new Error("Pi session is closed");
+    if (this.activeTurnId !== turnId) return { turnId };
     this.activeNoTurnPromptText = payload.text;
     const shouldProbeForNoTurnPrompt = this.parseSlashCommandInput(payload.text) !== null;
 
     void (async () => {
       try {
+        if (this.compactionPromise) {
+          // Pi RPC rejects prompts until the manual compaction request settles.
+          await this.compactionPromise.catch(() => undefined);
+          const turnCanceled =
+            this.closed || this.activeTurnId !== turnId || this.interruptingTurn?.turnId === turnId;
+          if (turnCanceled) {
+            return;
+          }
+        }
         const ack = await this.runtimeSession.prompt(payload.text, payload.images);
         this.activePromptRequestId = ack.requestId ?? null;
         const correlatedResult = ack.requestId
@@ -1344,6 +1368,7 @@ export class PiRpcAgentSession implements AgentSession {
         this.activeTurnStartedEmitted = false;
         this.pendingSettledMessages = null;
         this.activeAssistantMessageId = null;
+        this.pendingSteerSubmissions.length = 0;
         this.clearNoTurnBuffers();
         if (isPiRequestAbortError(error)) {
           this.emit({
@@ -1366,6 +1391,65 @@ export class PiRpcAgentSession implements AgentSession {
     return { turnId };
   }
 
+  async steerActiveTurn(
+    prompt: AgentPromptInput,
+    options: SteerActiveTurnOptions,
+  ): Promise<SteerResult> {
+    if (this.closed || this.activeTurnId !== options.expectedTurnId) {
+      return { status: "unavailable" };
+    }
+    const payload = await convertPromptInput(prompt, { model: this.state.model });
+    if (this.closed || this.activeTurnId !== options.expectedTurnId)
+      return { status: "unavailable" };
+    // Pi rejects steer RPCs that are extension commands, so slash inputs keep the
+    // interrupt-and-replace fallback where they can run directly.
+    if (this.parseSlashCommandInput(payload.text)) {
+      return { status: "unavailable" };
+    }
+
+    try {
+      await this.runtimeSession.steer(payload.text, payload.images);
+    } catch (error) {
+      if (isPiDefinitiveSteerRejection(error)) {
+        return { status: "unavailable" };
+      }
+      throw error;
+    }
+    // The steer is already queued inside pi; if the turn moved on meanwhile its fate
+    // is ambiguous, so surface it instead of replacing the wrong turn.
+    if (this.closed || this.activeTurnId !== options.expectedTurnId) {
+      return { status: "unavailable" };
+    }
+    this.pendingSteerSubmissions.push({
+      text: payload.text,
+      clientMessageId: options.clientMessageId ?? null,
+    });
+    if (options.clearPendingPermissions) {
+      await this.clearPendingPermissionsForSteer();
+    }
+    return { status: "accepted" };
+  }
+
+  private async clearPendingPermissionsForSteer(): Promise<void> {
+    const requestIds = Array.from(this.pendingExtensionUiRequests.keys());
+    for (const requestId of requestIds) {
+      if (!this.pendingExtensionUiRequests.has(requestId)) continue;
+      await this.respondToPermission(requestId, {
+        behavior: "deny",
+        message: "The user answered with a message instead of approving. Their message follows.",
+      });
+    }
+  }
+
+  private takePendingSteerSubmission(text: string): PiPendingSteerSubmission | undefined {
+    const index = this.pendingSteerSubmissions.findIndex((submission) => submission.text === text);
+    if (index < 0) {
+      return undefined;
+    }
+    const [submission] = this.pendingSteerSubmissions.splice(index, 1);
+    return submission;
+  }
+
   subscribe(callback: (event: AgentStreamEvent) => void): () => void {
     this.subscribers.add(callback);
     return () => {
@@ -1374,12 +1458,21 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
-    await this.requestEntryCapture("history");
-    yield* streamPiHistory(
-      this.provider,
-      await this.runtimeSession.getMessages(),
-      this.capturedUserEntries,
-    );
+    try {
+      await this.requestEntryCapture("history");
+      const history = await this.runtimeSession.getHistory();
+      yield* streamPiHistory(
+        this.provider,
+        history.messages,
+        history.userEntries,
+        {},
+        // At most eight 2 MiB child files per replay; later cards retain their summaries.
+        createPiExtensionHost(this.logger, undefined, 16 * 1024 * 1024),
+        this.closeController.signal,
+      );
+    } finally {
+      if (this.closeAfterHistory) await this.close();
+    }
   }
 
   async getRuntimeInfo(): Promise<AgentRuntimeInfo> {
@@ -1388,10 +1481,7 @@ export class PiRpcAgentSession implements AgentSession {
       provider: this.provider,
       sessionId: this.state.sessionId,
       model: modelToId(this.state.model),
-      thinkingOptionId: resolveThinkingOptionId(
-        this.lastKnownThinkingOptionId,
-        this.state.thinkingLevel,
-      ),
+      thinkingOptionId: this.state.thinkingLevel,
       modeId: this.currentModeId,
     };
   }
@@ -1419,15 +1509,11 @@ export class PiRpcAgentSession implements AgentSession {
     }
     this.pendingExtensionUiRequests.delete(requestId);
 
-    if (isCombinedAskUserPermission(request)) {
-      const combined = buildCombinedAskUserSelectionResponse(request, response);
-      this.pendingCombinedAskUserResponse = combined.pendingResponse;
-      this.runtimeSession.respondToExtensionUiRequest(requestId, combined.uiResponse);
-    } else {
-      this.runtimeSession.respondToExtensionUiRequest(
-        requestId,
-        buildExtensionUiResponse(request, response),
-      );
+    const mapped = this.extensionHost.respondToPermission(request, response);
+    for (const reply of mapped?.responses ?? [
+      { id: requestId, response: buildExtensionUiResponse(request, response) },
+    ]) {
+      this.runtimeSession.respondToExtensionUiRequest(reply.id, reply.response);
     }
     this.emit({
       type: "permission_resolved",
@@ -1442,7 +1528,7 @@ export class PiRpcAgentSession implements AgentSession {
     return {
       provider: this.provider,
       sessionId: this.state.sessionId,
-      nativeHandle: this.state.sessionFile,
+      nativeHandle: this.persistedSessionFile ?? this.state.sessionFile,
       metadata: {
         cwd: this.config.cwd,
         ...(this.config.model ? { model: this.config.model } : {}),
@@ -1453,20 +1539,27 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   async interrupt(): Promise<void> {
-    const turnId = this.activeTurnId;
-    if (turnId) {
-      this.interruptingTurnId = turnId;
-      this.lastInterruptedTurnId = turnId;
-    }
+    const turnId = this.activeTurnId ?? undefined;
+    const interruption: typeof this.interruptingTurn =
+      this.activeTurnId || this.activeTurnStarted ? { turnId, error: null } : null;
+    this.interruptingTurn = interruption;
     try {
+      try {
+        await this.runtimeSession.clearQueue();
+      } catch (error) {
+        // COMPAT(piClearQueueFallback): added in v0.5.0, remove after 2027-03-01 once
+        // the pi floor supports clear_queue (added in pi 0.84.4).
+        if (!isPiMissingClearQueueRpc(error)) {
+          throw error;
+        }
+      }
       await this.runtimeSession.abort();
     } catch (error) {
-      if (this.interruptingTurnId === turnId) {
-        this.interruptingTurnId = null;
+      const terminalError = this.interruptingTurn === interruption ? interruption?.error : null;
+      if (this.interruptingTurn === interruption) {
+        this.interruptingTurn = null;
       }
-      if (this.interruptedTerminalError?.turnId === turnId) {
-        const terminalError = this.interruptedTerminalError;
-        this.interruptedTerminalError = null;
+      if (terminalError) {
         this.usagePoller.stopTurn();
         this.activeTurnId = null;
         this.activeClientMessageId = null;
@@ -1474,17 +1567,23 @@ export class PiRpcAgentSession implements AgentSession {
         this.activeTurnStartedEmitted = false;
         this.pendingSettledMessages = null;
         this.activeAssistantMessageId = null;
+        this.pendingSteerSubmissions.length = 0;
         this.clearNoTurnBuffers();
         this.emit({
           type: "turn_failed",
           provider: this.provider,
           turnId,
-          error: terminalError.error,
+          error: terminalError,
         });
       }
       throw error;
     }
-    if (turnId && this.activeTurnId === turnId) {
+    if (
+      interruption &&
+      this.interruptingTurn === interruption &&
+      (this.activeTurnId || this.activeTurnStarted) &&
+      (this.activeTurnId ?? undefined) === turnId
+    ) {
       this.usagePoller.stopTurn();
       this.activeTurnId = null;
       this.activeClientMessageId = null;
@@ -1492,6 +1591,7 @@ export class PiRpcAgentSession implements AgentSession {
       this.activeTurnStartedEmitted = false;
       this.pendingSettledMessages = null;
       this.activeAssistantMessageId = null;
+      this.pendingSteerSubmissions.length = 0;
       this.clearNoTurnBuffers();
       this.emit({
         type: "turn_canceled",
@@ -1500,11 +1600,8 @@ export class PiRpcAgentSession implements AgentSession {
         turnId,
       });
     }
-    if (this.interruptingTurnId === turnId) {
-      this.interruptingTurnId = null;
-    }
-    if (this.interruptedTerminalError?.turnId === turnId) {
-      this.interruptedTerminalError = null;
+    if (this.interruptingTurn === interruption) {
+      this.interruptingTurn = null;
     }
   }
 
@@ -1514,7 +1611,7 @@ export class PiRpcAgentSession implements AgentSession {
     }
     await this.refreshState().catch(() => undefined);
     await this.requestEntryCapture("rewind");
-    const targetEntry = this.capturedUserEntriesById.get(input.messageId);
+    const targetEntry = this.treeUserEntriesById.get(input.messageId);
     if (!targetEntry) {
       throw new Error(`Pi rewind target ${input.messageId} was not found in captured tree entries`);
     }
@@ -1536,15 +1633,35 @@ export class PiRpcAgentSession implements AgentSession {
     return await resultPromise;
   }
 
+  async canStopRuntime(): Promise<boolean> {
+    if (
+      this.closed ||
+      this.activeTurnId ||
+      this.pendingExtensionUiRequests.size ||
+      this.pendingExtensionResults.size ||
+      this.pendingExtensionHydrations.size ||
+      this.pendingOutput ||
+      this.pendingSteerSubmissions.length ||
+      this.pendingNoTurnOutputs.length ||
+      this.interruptingTurn
+    )
+      return false;
+    const state = await this.runtimeSession.getState();
+    return !state.isStreaming && !state.isCompacting && state.pendingMessageCount === 0;
+  }
+
   async close(): Promise<void> {
     if (this.closed) {
       return;
     }
     this.closed = true;
+    this.closeController.abort();
+    this.extensionHost.close();
     this.usagePoller.close();
     try {
       await this.runtimeSession.close();
     } finally {
+      await Promise.all([this.pendingOutput, ...this.pendingExtensionHydrations]);
       this.rejectAllExtensionResults(new Error("Pi session closed"));
       this.cleanup?.();
     }
@@ -1587,38 +1704,71 @@ export class PiRpcAgentSession implements AgentSession {
     return null;
   }
 
-  async setModel(modelId: string | null): Promise<void> {
+  async setModel(modelId: string | null): Promise<{ model: string | null }> {
     const parsedReference = parseModelReference(modelId);
     if (!parsedReference) {
-      return;
+      return { model: modelToId(this.state.model) };
     }
     if (!parsedReference.provider) {
       throw new Error(`Pi model id must include a provider: ${modelId}`);
     }
 
     const model = await this.runtimeSession.setModel(parsedReference.provider, parsedReference.id);
-    this.state = {
-      ...this.state,
-      model,
-    };
+    await this.refreshState();
     this.config.model = `${model.provider}/${model.id}`;
+    return { model: modelToId(this.state.model) };
   }
 
   async setThinkingOption(thinkingOptionId: string | null): Promise<void> {
     const thinkingLevel = normalizePiThinkingOption(thinkingOptionId) ?? DEFAULT_PI_THINKING_LEVEL;
     await this.runtimeSession.setThinkingLevel(thinkingLevel);
-    this.lastKnownThinkingOptionId = thinkingLevel;
-    this.config.thinkingOptionId = thinkingLevel;
-    this.state = {
-      ...this.state,
-      thinkingLevel,
-    };
+    await this.refreshState();
   }
 
   private emit(event: AgentStreamEvent): void {
-    for (const subscriber of this.subscribers) {
-      subscriber(event);
+    if (this.pendingOutput) {
+      this.emitAsync(() => Promise.resolve([event]));
+      return;
     }
+    this.publish(event);
+  }
+
+  private publish(event: AgentStreamEvent): void {
+    for (const subscriber of this.subscribers) subscriber(event);
+  }
+
+  // Keep timeline order while images are materialized, without delaying provider state changes.
+  private emitAsync(render: () => Promise<AgentStreamEvent[]>): void {
+    const pending = (this.pendingOutput ?? Promise.resolve())
+      .then(render)
+      .then((events) => {
+        if (!this.closed) for (const event of events) this.publish(event);
+        return undefined;
+      })
+      .catch((error) => this.logger.error({ err: error }, "Pi output rendering failed"));
+    this.pendingOutput = pending;
+    void pending.then(() => {
+      if (this.pendingOutput === pending) this.pendingOutput = null;
+      return undefined;
+    });
+  }
+
+  private emitExtensionOutput(output: PiExtensionEventOutput | undefined, turnId?: string): void {
+    if (!output || this.closed) return;
+    for (const event of output.events) {
+      this.emit(event.type === "timeline" ? { ...event, turnId } : event);
+    }
+    const pending = output.hydration
+      .then((events) => {
+        if (this.closeController.signal.aborted) return;
+        for (const event of events) this.emit(event);
+        return undefined;
+      })
+      .catch((error) => {
+        this.logger.warn({ err: error }, "Pi extension hydration failed");
+      });
+    this.pendingExtensionHydrations.add(pending);
+    void pending.then(() => this.pendingExtensionHydrations.delete(pending));
   }
 
   private currentTurnIdForEvent(): string | undefined {
@@ -1730,7 +1880,8 @@ export class PiRpcAgentSession implements AgentSession {
     this.outOfBandCompactionStarted = false;
     this.outOfBandCompactionCompleted = false;
     try {
-      await this.runtimeSession.compact(customInstructions);
+      this.compactionPromise = this.runtimeSession.compact(customInstructions);
+      await this.compactionPromise;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (
@@ -1756,6 +1907,7 @@ export class PiRpcAgentSession implements AgentSession {
         },
       });
     } finally {
+      this.compactionPromise = null;
       if (this.outOfBandCompactionEmit === emit && !this.outOfBandCompactionStarted) {
         this.outOfBandCompactionEmit = null;
         this.outOfBandCompactionStarted = false;
@@ -1869,10 +2021,9 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   private recordCapturedUserEntries(entries: PiCapturedEntry[]): void {
-    this.capturedUserEntries.splice(0, this.capturedUserEntries.length, ...entries);
-    this.capturedUserEntriesById.clear();
+    this.treeUserEntriesById.clear();
     for (const entry of entries) {
-      this.capturedUserEntriesById.set(entry.id, entry);
+      this.treeUserEntriesById.set(entry.id, entry);
     }
   }
 
@@ -1885,6 +2036,10 @@ export class PiRpcAgentSession implements AgentSession {
     if (!entry) {
       return true;
     }
+    const pendingSteer = this.takePendingSteerSubmission(entry.text);
+    const clientMessageId = pendingSteer
+      ? pendingSteer.clientMessageId
+      : this.activeClientMessageId;
     this.emit({
       type: "timeline",
       provider: this.provider,
@@ -1893,7 +2048,7 @@ export class PiRpcAgentSession implements AgentSession {
         type: "user_message",
         text: entry.text,
         messageId: entry.id,
-        ...(this.activeClientMessageId ? { clientMessageId: this.activeClientMessageId } : {}),
+        ...(clientMessageId ? { clientMessageId } : {}),
       },
     });
     return true;
@@ -1904,10 +2059,9 @@ export class PiRpcAgentSession implements AgentSession {
     if (!payload) {
       return false;
     }
-    const entries = parseCapturedEntries(payload.entries);
-    this.recordCapturedUserEntries(entries);
+    this.recordCapturedUserEntries(parseCapturedEntries(payload.treeEntries));
     if (typeof payload.requestId === "string") {
-      this.resolveExtensionResult(payload.requestId, entries);
+      this.resolveExtensionResult(payload.requestId, undefined);
     }
     return true;
   }
@@ -1934,6 +2088,11 @@ export class PiRpcAgentSession implements AgentSession {
   ): void {
     const message = optionalString(event.message);
     if (event.method === "notify" && message) {
+      const extensionMapping = this.extensionHost.mapRuntimeNotification(message);
+      if (extensionMapping) {
+        this.emitExtensionOutput(extensionMapping, this.currentTurnIdForEvent());
+        return;
+      }
       if (
         this.handleSubmittedUserEntryMarker(message) ||
         this.handleEntryCaptureMarker(message) ||
@@ -1941,23 +2100,29 @@ export class PiRpcAgentSession implements AgentSession {
       ) {
         return;
       }
-      this.bufferNoTurnOutput(message);
-    }
-
-    if (this.respondToCombinedAskUserFollowUp(event)) {
+      this.emit({
+        type: "timeline",
+        provider: this.provider,
+        turnId: this.currentTurnIdForEvent(),
+        item: {
+          type: "notification",
+          level: toNotificationLevel(event.notifyType),
+          message,
+        },
+      });
       return;
     }
 
-    const shouldCombineOptionalComment =
-      event.method === "select" &&
-      this.activeAskUserDialog?.allowComment === true &&
-      this.activeAskUserDialog.allowMultiple === false;
-    const request = mapExtensionUiRequestToPermission(event, {
-      provider: this.provider,
-      label: "Pi",
-      combineOptionalComment: shouldCombineOptionalComment,
-      allowFreeform: this.activeAskUserDialog?.allowFreeform,
-    });
+    const mapped = this.extensionHost.mapDialog(event, this.provider);
+    if (mapped?.type === "response") {
+      this.runtimeSession.respondToExtensionUiRequest(event.id, mapped.response);
+      return;
+    }
+    if (mapped?.type === "deferred") return;
+    const request =
+      mapped?.type === "permission"
+        ? mapped.request
+        : mapExtensionUiRequestToPermission(event, { provider: this.provider, label: "Pi" });
     if (!request) {
       return;
     }
@@ -1969,33 +2134,6 @@ export class PiRpcAgentSession implements AgentSession {
       request,
       turnId: this.currentTurnIdForEvent(),
     });
-  }
-
-  private respondToCombinedAskUserFollowUp(
-    event: Extract<PiRuntimeEvent, { type: "extension_ui_request" }>,
-  ): boolean {
-    const pending = this.pendingCombinedAskUserResponse;
-    if (!pending || event.method !== "input") {
-      return false;
-    }
-
-    const placeholder = optionalString(event.placeholder);
-    if (pending.freeform !== null && !isOptionalInputPlaceholder(placeholder)) {
-      this.pendingCombinedAskUserResponse = {
-        ...pending,
-        freeform: null,
-      };
-      this.runtimeSession.respondToExtensionUiRequest(event.id, { value: pending.freeform });
-      return true;
-    }
-
-    if (isOptionalInputPlaceholder(placeholder)) {
-      this.pendingCombinedAskUserResponse = null;
-      this.runtimeSession.respondToExtensionUiRequest(event.id, { value: pending.comment });
-      return true;
-    }
-
-    return false;
   }
 
   private handleCommandOutput(textValue: unknown): void {
@@ -2057,17 +2195,20 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   private handleProcessExit(error: string): void {
+    this.runtimeDead = true;
     this.rejectAllExtensionResults(new Error(error));
-    if (!this.activeTurnId) {
+    this.interruptingTurn = null;
+    if (!this.activeTurnId && !this.activeTurnStarted) {
       return;
     }
-    const turnId = this.activeTurnId;
+    const turnId = this.activeTurnId ?? undefined;
     this.usagePoller.stopTurn();
     this.activeTurnId = null;
     this.activeClientMessageId = null;
     this.activeTurnStarted = false;
     this.activeTurnStartedEmitted = false;
     this.pendingSettledMessages = null;
+    this.pendingSteerSubmissions.length = 0;
     this.clearNoTurnBuffers();
     this.emit({
       type: "turn_failed",
@@ -2085,6 +2226,15 @@ export class PiRpcAgentSession implements AgentSession {
     }
 
     switch (event.type) {
+      case "thinking_level_changed":
+        this.state = { ...this.state, thinkingLevel: event.level };
+        this.config.thinkingOptionId = event.level;
+        this.emit({
+          type: "thinking_option_changed",
+          provider: this.provider,
+          thinkingOptionId: event.level,
+        });
+        return;
       case "agent_start":
         this.activeTurnStarted = true;
         this.clearNoTurnBuffers();
@@ -2119,7 +2269,25 @@ export class PiRpcAgentSession implements AgentSession {
       case "tool_execution_start": {
         const toolCall = parseToolArgs(event.toolName, event.args);
         this.activeToolCalls.set(event.toolCallId, toolCall);
-        this.activeAskUserDialog = readActiveAskUserDialog(event.toolName, event.args);
+        const request = this.extensionHost.onToolStart(
+          {
+            callId: event.toolCallId,
+            toolName: event.toolName,
+            args: toolCall.args,
+            status: "running",
+            result: null,
+          },
+          this.provider,
+        );
+        if (request) {
+          this.pendingExtensionUiRequests.set(request.id, request);
+          this.emit({
+            type: "permission_requested",
+            provider: this.provider,
+            request,
+            turnId: this.currentTurnIdForEvent(),
+          });
+        }
         this.emitToolCallEvent(event.toolCallId, toolCall, "running", null, null);
         return;
       }
@@ -2180,6 +2348,9 @@ export class PiRpcAgentSession implements AgentSession {
     event: Extract<PiAgentSessionEvent, { type: "agent_end" | "agent_settled" }>;
     turnId: string | undefined;
   }): void {
+    if (!this.activeTurnId && !this.activeTurnStarted) {
+      return;
+    }
     if (event.type === "agent_end") {
       // COMPAT(piAgentSettled): added in v0.5.0, remove after 2027-02-21 once the Pi
       // floor emits agent_settled and willRetry.
@@ -2187,14 +2358,10 @@ export class PiRpcAgentSession implements AgentSession {
         this.completeTurn(turnId, event.messages ?? []);
         return;
       }
-      if (this.activeTurnId) {
-        this.pendingSettledMessages = event.messages ?? [];
-      }
+      this.pendingSettledMessages = event.messages ?? [];
       return;
     }
-    if (this.activeTurnId) {
-      this.completeTurn(turnId, this.pendingSettledMessages ?? []);
-    }
+    this.completeTurn(turnId, this.pendingSettledMessages ?? []);
   }
 
   private handleToolExecutionEnd(
@@ -2204,15 +2371,44 @@ export class PiRpcAgentSession implements AgentSession {
       this.activeToolCalls.get(event.toolCallId) ?? parseToolArgs(event.toolName, null);
     this.activeToolCalls.delete(event.toolCallId);
 
-    if (event.toolName === "ask_user") {
-      this.activeAskUserDialog = null;
-      this.pendingCombinedAskUserResponse = null;
-    }
-
-    const result = parseToolResult(event.result);
-    const error = event.isError ? event.result : null;
+    // Pull image blocks out of the result so base64 never reaches the tool output, then render
+    // each one as an assistant_message markdown image after the tool_call (mirroring the Claude
+    // provider, upstream #1717).
+    const { images, result } = splitPiToolResultImages(parseToolResult(event.result));
+    const error = event.isError ? result : null;
     const status = event.isError ? "failed" : "completed";
+    this.extensionHost.onToolEnd({
+      callId: event.toolCallId,
+      toolName: toolCall.toolName,
+      args: toolCall.args,
+      status,
+      result,
+    });
     this.emitToolCallEvent(event.toolCallId, toolCall, status, result, error);
+    if (images.length === 0) return;
+    const turnId = this.currentTurnIdForEvent();
+    this.emitAsync(() => this.renderToolResultImages(images, turnId));
+  }
+
+  private async renderToolResultImages(
+    images: ProviderImageOutput[],
+    turnId: string | undefined,
+  ): Promise<AgentStreamEvent[]> {
+    const events: AgentStreamEvent[] = [];
+    for (const image of images) {
+      const imageItem = await renderProviderImageOutputAsAssistantMarkdown(image, {
+        materialize: materializeProviderImage,
+      });
+      if (imageItem && !this.closed) {
+        events.push({
+          type: "timeline",
+          provider: this.provider,
+          turnId,
+          item: imageItem,
+        });
+      }
+    }
+    return events;
   }
 
   private emitCompactionTimeline(input: {
@@ -2296,16 +2492,24 @@ export class PiRpcAgentSession implements AgentSession {
       return;
     }
     if (event.message.role === "custom") {
+      const customMapping = this.extensionHost.mapCustomMessage(event.message);
+      this.emitExtensionOutput(customMapping, turnId);
       const text = getUserMessageText(event.message.content);
-      if (text) {
+      if (event.message.display !== false && text) {
         this.emit({
           type: "timeline",
           provider: this.provider,
           turnId,
-          item: { type: "assistant_message", text },
+          item: mapCustomMessageToToolCall(
+            event.message,
+            text,
+            `${this.provider}-custom-${randomUUID()}`,
+          ),
         });
       }
-      this.completeTurn(turnId, []);
+      if (!this.activeTurnStarted) {
+        this.completeTurn(turnId, []);
+      }
       return;
     }
   }
@@ -2318,14 +2522,21 @@ export class PiRpcAgentSession implements AgentSession {
     error: unknown,
   ): boolean {
     const turnId = this.currentTurnIdForEvent();
-    const detail = this.mapToolDetail(toolCallId, toolCall, result);
+    const mapping = this.extensionHost.mapToolCall({
+      callId: toolCallId,
+      toolName: toolCall.toolName,
+      args: toolCall.args,
+      status,
+      result,
+    });
+    const detail = mapping?.detail ?? mapToolDetail(toolCall, result);
     if (!detail) {
       return false;
     }
     const baseItem = {
       type: "tool_call" as const,
       callId: toolCallId,
-      name: resolveToolCallName(toolCall, result),
+      name: mapping?.name ?? toolCall.toolName,
       detail,
     };
     const item =
@@ -2336,40 +2547,29 @@ export class PiRpcAgentSession implements AgentSession {
       turnId,
       item,
     });
+    this.emitExtensionOutput(mapping, turnId);
     return true;
   }
 
-  private mapToolDetail(
-    _toolCallId: string,
-    toolCall: PiTrackedToolCall,
-    result: PiToolResult,
-  ): ToolCallDetail | null {
-    return mapToolDetail(toolCall, result);
-  }
-
   private completeTurn(turnId: string | undefined, messages: PiAgentMessage[]): void {
-    if (turnId && this.interruptingTurnId === turnId && isPiAbortedTerminalResponse(messages)) {
-      this.interruptedTerminalError = {
-        turnId,
-        error: latestPiErrorMessage(messages) ?? "Pi turn failed",
-      };
-      return;
-    }
+    const errorMessage = latestPiErrorMessage(messages);
     if (
-      isPiAbortedTerminalResponse(messages) &&
-      (turnId === this.lastInterruptedTurnId || (!turnId && this.lastInterruptedTurnId !== null))
+      this.interruptingTurn &&
+      this.interruptingTurn.turnId === turnId &&
+      (errorMessage || isPiAbortedTerminalResponse(messages))
     ) {
-      this.lastInterruptedTurnId = null;
+      this.interruptingTurn.error = errorMessage ?? "Pi turn failed";
       return;
     }
+    this.interruptingTurn = null;
     this.activeTurnId = null;
     this.activeClientMessageId = null;
     this.activeAssistantMessageId = null;
     this.activeTurnStarted = false;
     this.activeTurnStartedEmitted = false;
     this.pendingSettledMessages = null;
+    this.pendingSteerSubmissions.length = 0;
     this.clearNoTurnBuffers();
-    const errorMessage = latestPiErrorMessage(messages);
     if (typeof errorMessage === "string" && errorMessage.length > 0) {
       this.usagePoller.stopTurn();
       this.emit({
@@ -2391,6 +2591,7 @@ export class PiRpcAgentSession implements AgentSession {
 
   private async refreshState(): Promise<void> {
     this.state = await this.runtimeSession.getState();
+    this.config.thinkingOptionId = this.state.thinkingLevel;
   }
 
   private async refreshAfterTurn(finalUsage: Promise<void>): Promise<void> {
@@ -2404,8 +2605,7 @@ export class PiRpcAgentClient implements AgentClient {
 
   private readonly logger: Logger;
   private readonly runtimeSettings?: ProviderRuntimeSettings;
-  private readonly providerParams: PiProviderParams;
-  private readonly runtime: PiRuntime;
+  private readonly runtime?: PiRuntime;
   private readonly usagePollScheduler?: PiUsagePollScheduler;
 
   constructor(options: PiRpcAgentClientOptions) {
@@ -2413,10 +2613,7 @@ export class PiRpcAgentClient implements AgentClient {
     this.capabilities = capabilitiesForClient();
     this.logger = options.logger;
     this.runtimeSettings = options.runtimeSettings;
-    this.providerParams = PiProviderParamsSchema.parse(options.providerParams ?? {});
-    this.runtime =
-      options.runtime ??
-      createRuntime(options.logger, options.runtimeSettings, this.providerParams.rpcTimeoutMs);
+    this.runtime = options.runtime;
     this.usagePollScheduler = options.usagePollScheduler;
   }
 
@@ -2424,28 +2621,31 @@ export class PiRpcAgentClient implements AgentClient {
     config: AgentSessionConfig,
     launchContext?: AgentLaunchContext,
   ): Promise<AgentSession> {
+    const providerOptions = PiProviderOptionsSchema.parse(config.providerOptions ?? {});
+    const runtime = this.resolveRuntime(providerOptions.rpcTimeoutMs);
     const mcpEnv = {
       ...this.runtimeSettings?.env,
       ...launchContext?.env,
     };
-    const mcpConfig = await this.prepareMcpConfig(config.cwd, config.mcpServers, mcpEnv);
-    const paseoExtension = createPiPaseoExtensionFile(
-      composeSystemPromptParts(config.systemPrompt, config.daemonAppendSystemPrompt),
-    );
+    const mcp = await this.prepareMcpInjection(config.cwd, config.mcpServers, mcpEnv, runtime);
+    const mcpConfigFile = mcp?.kind === "adapter" ? mcp.configFile : null;
+    const paseoExtension = createPiPaseoExtensionFile({
+      systemPrompt: composeSystemPromptParts(config.systemPrompt, config.daemonAppendSystemPrompt),
+      mcpServers: mcp?.kind === "builtin" ? mcp.servers : undefined,
+    });
     let runtimeSession: PiRuntimeSession;
     try {
-      runtimeSession = await this.runtime.startSession({
+      runtimeSession = await runtime.startSession({
         cwd: config.cwd,
         model: config.model,
-        thinkingOptionId:
-          normalizePiThinkingOption(config.thinkingOptionId) ?? DEFAULT_PI_THINKING_LEVEL,
+        thinkingOptionId: normalizePiThinkingOption(config.thinkingOptionId) ?? undefined,
         noSession: config.internal === true,
         env: launchContext?.env,
-        mcpConfigPath: mcpConfig?.path,
+        mcpConfigPath: mcpConfigFile?.path,
         extensionPaths: paseoExtension ? [paseoExtension.path] : undefined,
       });
     } catch (error) {
-      mcpConfig?.cleanup();
+      mcpConfigFile?.cleanup();
       paseoExtension?.cleanup();
       throw error;
     }
@@ -2454,15 +2654,15 @@ export class PiRpcAgentClient implements AgentClient {
         runtimeSession,
         config,
         initialState: await runtimeSession.getState(),
-        capabilities: capabilitiesForSession(mcpConfig !== null),
-        cleanup: combineCleanup([mcpConfig?.cleanup, paseoExtension?.cleanup]),
-        extensionTimeoutMs: this.providerParams.extensionTimeoutMs,
+        capabilities: capabilitiesForSession(mcp !== null),
+        cleanup: combineCleanup([mcpConfigFile?.cleanup, paseoExtension?.cleanup]),
+        extensionTimeoutMs: providerOptions.extensionTimeoutMs,
         logger: this.logger,
         usagePollScheduler: this.usagePollScheduler,
       });
     } catch (error) {
       await runtimeSession.close().catch(() => undefined);
-      mcpConfig?.cleanup();
+      mcpConfigFile?.cleanup();
       paseoExtension?.cleanup();
       throw error;
     }
@@ -2472,6 +2672,7 @@ export class PiRpcAgentClient implements AgentClient {
     handle: AgentPersistenceHandle,
     overrides?: Partial<AgentSessionConfig>,
     launchContext?: AgentLaunchContext,
+    options?: AgentResumeSessionOptions,
   ): Promise<AgentSession> {
     const sessionFile = handle.nativeHandle;
     if (!sessionFile) {
@@ -2480,61 +2681,114 @@ export class PiRpcAgentClient implements AgentClient {
 
     const persistenceMetadata = parsePersistenceMetadata(handle.metadata);
     const resumeConfig = buildResumeConfig(persistenceMetadata, overrides, this.provider);
+    const processCwd = await resolveResumeProcessCwd(resumeConfig.cwd, options?.purpose);
 
+    const providerOptions = PiProviderOptionsSchema.parse(
+      resumeConfig.config.providerOptions ?? {},
+    );
+    const runtime = this.resolveRuntime(providerOptions.rpcTimeoutMs);
     const mcpEnv = {
       ...this.runtimeSettings?.env,
       ...launchContext?.env,
     };
-    const mcpConfig = await this.prepareMcpConfig(
-      resumeConfig.cwd,
+    const mcp = await this.prepareMcpInjection(
+      processCwd,
       resumeConfig.config.mcpServers,
       mcpEnv,
+      runtime,
     );
-    const paseoExtension = createPiPaseoExtensionFile(
-      composeSystemPromptParts(
+    const mcpConfigFile = mcp?.kind === "adapter" ? mcp.configFile : null;
+    const paseoExtension = createPiPaseoExtensionFile({
+      systemPrompt: composeSystemPromptParts(
         resumeConfig.config.systemPrompt,
         resumeConfig.config.daemonAppendSystemPrompt,
       ),
-    );
+      mcpServers: mcp?.kind === "builtin" ? mcp.servers : undefined,
+    });
+    const tempFiles = mcpConfigFile ? [mcpConfigFile, paseoExtension] : [paseoExtension];
+    const cleanupTempFiles = () => {
+      for (const tempFile of tempFiles) tempFile.cleanup();
+    };
+    let sessionCopy: PiTempFile | null = null;
     let runtimeSession: PiRuntimeSession;
     try {
-      runtimeSession = await this.runtime.startSession(
+      if (processCwd !== resumeConfig.cwd) {
+        sessionCopy = await createPiSessionCopy(sessionFile, processCwd);
+        tempFiles.push(sessionCopy);
+      }
+      runtimeSession = await runtime.startSession(
         buildResumeStartInput({
           resumeConfig,
-          sessionFile,
+          processCwd,
+          sessionFile: sessionCopy?.path ?? sessionFile,
           launchContext,
-          mcpConfig,
+          mcpConfigFile,
           paseoExtension,
         }),
       );
     } catch (error) {
-      mcpConfig?.cleanup();
-      paseoExtension?.cleanup();
+      cleanupTempFiles();
       throw error;
     }
     try {
+      const initialState = await this.applyResumeModel(runtimeSession, resumeConfig.model);
       return new PiRpcAgentSession({
         runtimeSession,
-        config: resumeConfig.config,
-        initialState: await runtimeSession.getState(),
-        capabilities: capabilitiesForSession(mcpConfig !== null),
-        cleanup: combineCleanup([mcpConfig?.cleanup, paseoExtension?.cleanup]),
-        extensionTimeoutMs: this.providerParams.extensionTimeoutMs,
+        config: {
+          ...resumeConfig.config,
+          model: modelToId(initialState.model) ?? resumeConfig.config.model,
+        },
+        initialState,
+        capabilities: capabilitiesForSession(mcp !== null),
+        persistedSessionFile: sessionCopy ? sessionFile : undefined,
+        cleanup: cleanupTempFiles,
+        closeAfterHistory: options?.purpose === "history",
+        extensionTimeoutMs: providerOptions.extensionTimeoutMs,
         logger: this.logger,
         usagePollScheduler: this.usagePollScheduler,
       });
     } catch (error) {
       await runtimeSession.close().catch(() => undefined);
-      mcpConfig?.cleanup();
-      paseoExtension?.cleanup();
+      cleanupTempFiles();
       throw error;
     }
+  }
+
+  // Pi resumes a session on the model it recorded, or on its default when that model
+  // is gone. Switching afterwards keeps a removed model from blocking the resume.
+  private async applyResumeModel(
+    runtimeSession: PiRuntimeSession,
+    requestedModel: string | undefined,
+  ): Promise<PiSessionState> {
+    const state = await runtimeSession.getState();
+    const reference = parseModelReference(requestedModel ?? null);
+    if (!reference?.provider) {
+      return state;
+    }
+    const { provider, id } = reference;
+    const isRequested = (model: PiModel | null | undefined) =>
+      model?.provider === provider && model.id === id;
+    if (isRequested(state.model)) {
+      return state;
+    }
+    const availableModels = await runtimeSession.getAvailableModels();
+    if (!availableModels.some(isRequested)) {
+      this.logger.warn(
+        { requestedModel, sessionModel: modelToId(state.model) },
+        "Pi resumed on the session's model because the requested model is unavailable",
+      );
+      return state;
+    }
+    await runtimeSession.setModel(provider, id);
+    return runtimeSession.getState();
   }
 
   async fetchCatalog(
     options: FetchCatalogOptions,
     context?: ProviderRefreshContext,
   ): Promise<ProviderCatalog> {
+    const providerOptions = PiProviderOptionsSchema.parse(options.providerOptions ?? {});
+    const runtime = this.resolveRuntime(providerOptions.rpcTimeoutMs);
     let runtimeSession: PiRuntimeSession | undefined;
     let closePromise: Promise<void> | undefined;
     const closeSession = () => {
@@ -2546,7 +2800,7 @@ export class PiRpcAgentClient implements AgentClient {
     context?.signal.addEventListener("abort", handleAbort, { once: true });
     try {
       await runProviderRefreshActivity(context, "runtime.start", async () => {
-        runtimeSession = await this.runtime.startSession({
+        runtimeSession = await runtime.startSession({
           cwd: options.scope === "global" ? homedir() : options.cwd,
           signal: context?.signal,
         });
@@ -2554,12 +2808,23 @@ export class PiRpcAgentClient implements AgentClient {
       });
       if (!runtimeSession) throw new Error("Pi catalog runtime did not start");
       const catalogSession = runtimeSession;
+      const piModels = await runProviderRefreshActivity(context, "get_available_models", () =>
+        catalogSession.getAvailableModels(null),
+      );
+      // A fresh Pi session starts on the model Pi resolves from its own settings.
+      const { model: configuredModel } = await runProviderRefreshActivity(
+        context,
+        "get_state",
+        () => catalogSession.getState(),
+      );
       const models = transformPiModels(
-        (
-          await runProviderRefreshActivity(context, "get_available_models", () =>
-            catalogSession.getAvailableModels(null),
-          )
-        ).map((model) => mapPiModel(model, PI_PROVIDER)),
+        piModels.map((model) => {
+          const mapped = mapPiModel(model, PI_PROVIDER);
+          const isConfigured =
+            model.provider === configuredModel?.provider && model.id === configuredModel?.id;
+          if (isConfigured) mapped.isDefault = true;
+          return mapped;
+        }),
       );
       return { models, modes: [] };
     } finally {
@@ -2568,8 +2833,8 @@ export class PiRpcAgentClient implements AgentClient {
     }
   }
 
-  async listFeatures(_config: AgentSessionConfig): Promise<AgentFeature[]> {
-    return [];
+  async listControls(config: AgentSessionConfig): Promise<AgentDraftControls> {
+    return { controls: [], options: config.providerOptions ?? {} };
   }
 
   async listImportableSessions(
@@ -2577,7 +2842,7 @@ export class PiRpcAgentClient implements AgentClient {
   ): Promise<ImportableProviderSession[]> {
     return await listPiImportableSessions({
       ...options,
-      sessionDir: this.providerParams.sessionDir,
+      sessionDir: PiProviderOptionsSchema.parse(options?.providerOptions ?? {}).sessionDir,
       runtimeSettings: this.runtimeSettings,
     });
   }
@@ -2629,33 +2894,53 @@ export class PiRpcAgentClient implements AgentClient {
     }
   }
 
-  private async prepareMcpConfig(
+  private resolveRuntime(rpcTimeoutMs: number): PiRuntime {
+    return this.runtime ?? createRuntime(this.logger, this.runtimeSettings, rpcTimeoutMs);
+  }
+
+  private async prepareMcpInjection(
     cwd: string,
     servers: Record<string, McpServerConfig> | undefined,
     env: Record<string, string> | undefined,
-  ): Promise<PiMcpConfigFile | null> {
+    runtime: PiRuntime,
+  ): Promise<PiMcpInjection | null> {
     if (!servers || Object.keys(servers).length === 0) {
       return null;
     }
-    if (!(await this.detectMcpAdapter(cwd, env))) {
-      return null;
+    const mcpSupport = await this.detectMcpSupport(cwd, env, runtime);
+    if (mcpSupport === "builtin") {
+      return { kind: "builtin", servers: toPiBuiltinMcpServers(servers) };
     }
-    return createPiMcpConfigFile(servers, { piGlobalConfigEnv: env });
+    if (mcpSupport === "adapter") {
+      return {
+        kind: "adapter",
+        configFile: createPiMcpConfigFile(servers, { piGlobalConfigEnv: env }),
+      };
+    }
+    return null;
   }
 
-  private async detectMcpAdapter(cwd: string, env?: Record<string, string>): Promise<boolean> {
-    const runtimeSession = await this.runtime.startSession({ cwd, env }).catch((error) => {
-      this.logger.debug({ err: error, cwd }, "Pi MCP adapter probe failed to start");
+  private async detectMcpSupport(
+    cwd: string,
+    env: Record<string, string> | undefined,
+    runtime: PiRuntime,
+  ): Promise<PiMcpInjection["kind"] | null> {
+    const runtimeSession = await runtime.startSession({ cwd, env }).catch((error) => {
+      this.logger.debug({ err: error, cwd }, "Pi MCP probe failed to start");
       return null;
     });
     if (!runtimeSession) {
-      return false;
+      return null;
     }
     try {
-      return (await runtimeSession.getCommands()).some(isPiMcpAdapterCommand);
+      const commands = await runtimeSession.getCommands();
+      if (commands.some(isPiMcpAdapterCommand)) {
+        return "adapter";
+      }
+      return commands.some(isPiBuiltinMcpCommand) ? "builtin" : null;
     } catch (error) {
-      this.logger.debug({ err: error, cwd }, "Pi MCP adapter probe failed");
-      return false;
+      this.logger.debug({ err: error, cwd }, "Pi MCP probe failed");
+      return null;
     } finally {
       await runtimeSession.close().catch(() => undefined);
     }

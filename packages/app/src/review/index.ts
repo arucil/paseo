@@ -1,18 +1,12 @@
 export {
   buildReviewAttachmentSnapshot,
   buildReviewDraftKey,
-  buildReviewDraftScopeKey,
-  expireStaleDiffModeOverrides,
   getReviewDraftComments,
   resetReviewDraftStore,
   useClearReviewDraft,
   useReviewAttachmentSnapshot,
-  useResolvedDiffMode,
-  useSetDiffModeOverride,
   addReviewDraftComment,
   type BuildReviewDraftKeyInput,
-  type BuildReviewDraftScopeKeyInput,
-  type DiffModeOverride,
   type ReviewDraftCommentInput,
   type ReviewDraftComment,
   type ReviewDraftMode,
@@ -37,3 +31,8 @@ export {
   SMALL_ACTION_HIT_SLOP,
   useInlineReviewController,
 } from "./surface";
+
+export { ReviewCommentSheet } from "./comment-sheet";
+
+export { useReviewFeedback } from "./feedback/use-feedback";
+export { ReviewFeedbackAction } from "./feedback/surface";

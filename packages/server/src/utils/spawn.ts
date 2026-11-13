@@ -4,13 +4,6 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
 import { createExternalCommandProcessEnv, type ProcessEnvRecord } from "../server/paseo-env.js";
-import {
-  isWindowsCommandScript,
-  quoteWindowsArgument,
-  quoteWindowsCommand,
-} from "./windows-command.js";
-
-const execFileAsync = promisify(execFile);
 
 interface ExternalEnvOptions {
   baseEnv?: ProcessEnvRecord;
@@ -84,12 +77,10 @@ export function spawnProcess(
           workingDirectoryEnv,
         );
 
-  return spawn(resolvedCommand, resolvedArgs, {
+  return spawnCli(command, args, {
     ...spawnOptions,
     env: childEnv,
-    shell,
     signal: options?.signal,
-    windowsHide: true,
   });
 }
 
@@ -116,14 +107,14 @@ export async function execCommand(
           workingDirectoryEnv,
         );
 
-  return execFileAsync(resolvedCommand, resolvedArgs, {
+  return execCli(command, args, {
     cwd: options?.cwd,
     env: childEnv,
+    shell: options?.shell,
     encoding: options?.encoding ?? "utf8",
+    signal: options?.signal,
     killSignal: options?.killSignal,
     timeout: options?.timeout,
     maxBuffer: options?.maxBuffer,
-    shell,
-    windowsHide: true,
   }) as Promise<ExecCommandResult>;
 }

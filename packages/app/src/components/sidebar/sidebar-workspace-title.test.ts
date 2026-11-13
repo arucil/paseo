@@ -1,3 +1,4 @@
+import { i18n } from "@/i18n/i18next";
 import { describe, expect, it } from "vitest";
 import {
   resolveSidebarWorkspaceAccessibilityLabel,
@@ -52,6 +53,7 @@ describe("resolveSidebarWorkspaceAccessibilityLabel", () => {
       workspace: { name: "Investigate search", currentBranch: "fix/search", statusBucket: "done" },
       workspaceTitleSource: "title",
       hostBadgeLabel: "Build host",
+      t: i18n.t,
     });
 
     expect(label).toBe("Investigate search, Build host");
@@ -69,6 +71,7 @@ describe("resolveSidebarWorkspaceAccessibilityLabel", () => {
       hostBadgeLabel: "Build host",
       pullRequestLabel: "Pull request 42",
       serviceLabel: "Service web running",
+      t: i18n.t,
     });
 
     expect(label).toBe(
@@ -82,6 +85,7 @@ describe("resolveSidebarWorkspaceAccessibilityLabel", () => {
       workspaceTitleSource: "title",
       leadingProjectName: "Search project",
       hostBadgeLabel: "Build host",
+      t: i18n.t,
     });
 
     expect(label).toBe("Search project, Investigate search, Build host");

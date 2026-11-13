@@ -10,6 +10,7 @@ import {
 import type { WorkspaceDescriptor } from "@/stores/session-store";
 import { useWorkspaceLayoutStore } from "@/stores/workspace-layout-store";
 import { buildWorkspaceTabPersistenceKey } from "@/workspace-tabs/model";
+import { archiveWorkspaceWithUndo, supportsWorkspaceArchiveUndo } from "@/workspace/archive-undo";
 import { archiveWorkspaceOptimistically } from "@/workspace/workspace-archive";
 import { confirmDialog } from "@/utils/confirm-dialog";
 
@@ -63,6 +64,7 @@ export function useWorkspaceArchive(input: ArchiveWorkspaceInput): WorkspaceArch
       toast.error(t("sidebar.workspace.toasts.hostDisconnected"));
       return;
     }
+    const workspace = { serverId, workspaceId };
     onSetHiding?.(true);
     onArchiveStarted();
     try {

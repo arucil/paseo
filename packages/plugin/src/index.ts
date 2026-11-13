@@ -1,55 +1,43 @@
-import type { ComponentType } from "react";
-import type { PluginIconProps } from "./contracts.js";
-
-export {
-  PluginAttachmentItemSchema,
-  PluginAttachmentSearchPayloadSchema,
-  defineAttachmentSource,
-  defineRpc,
-  type PluginAttachmentItem,
-  type PluginAttachmentSearchPayload,
-  type PluginRpcContract,
-} from "./server.js";
-
-export declare const Icon: ComponentType<PluginIconProps>;
+// Shared SDK entry. Keep runtime-specific imports and re-exports on /client or /server.
 export type {
-  PluginAttachmentSourceContribution,
-  PluginAgentCommandContext,
-  PluginAgentPanelProps,
-  PluginAgentSnapshot,
-  PluginCleanup,
-  PluginCommandCapabilities,
-  PluginCommandCenterItemContribution,
-  PluginClientContext,
-  PluginClientContribution,
-  PluginClientOpenPanelOptions,
-  PluginComposerPillContribution,
-  PluginComposerPillProps,
-  PluginContribution,
-  PluginContext,
-  PluginGlobalCommandContext,
-  PluginHandlerContext,
-  PluginHostProps,
-  PluginOpenPanelOptions,
-  PluginIconProps,
-  PluginPanelLocation,
   PluginTheme,
-  PluginSidebarContribution,
-  PluginSurfaceContribution,
-  PluginSurfaceProps,
+  PluginWorkspaceSnapshot,
+  PluginAgentSnapshot,
+  PluginProjectSnapshot,
+  PluginTerminalSnapshot,
+  WorkspaceIndicator,
   PluginThemeColors,
   PluginThemeContribution,
+  PluginAttachmentSourceContribution,
   PluginTimelineData,
   PluginTimelineItem,
-  PluginTimelineItemProps,
-  PluginTimelineRendererContribution,
-  PluginTimelineTransformerContribution,
   PluginTimelineTransformResult,
-  PluginWorkspaceCommandContext,
-  PluginWorkspacePanelContribution,
-  PluginWorkspacePanelProps,
-  PluginWorkspaceSnapshot,
+  PluginCleanup,
 } from "./contracts.js";
-export { usePaseo } from "./paseo-context.js";
-export { useAgent, useWorkspace } from "./client-state.js";
-export { useRpc } from "./rpc-context.js";
+export { defineSettings, settingsRpc, type SettingsDefinition } from "./settings.js";
+export {
+  defineAttachmentSource,
+  PluginAttachmentItemSchema,
+  PluginAttachmentSearchPayloadSchema,
+  type PluginAttachmentItem,
+  type PluginAttachmentSearchPayload,
+} from "./attachments.js";
+export {
+  defineRpc,
+  defineSubscription,
+  type PluginRpcContract,
+  type PluginSubscriptionContract,
+  type RpcInput,
+  type RpcOutput,
+  type SubscriptionEvent,
+  type SubscriptionInput,
+} from "./rpc.js";
+
+export type { PluginText, PluginMessage } from "./text.js";
+export {
+  findSvgIconProblem,
+  PLUGIN_SVG_ICON_MAX_BYTES,
+  type PluginIconProps,
+  type PluginSerializableIcon,
+  type PluginSvgIcon,
+} from "./icons.js";

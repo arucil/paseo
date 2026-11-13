@@ -160,7 +160,9 @@ class MemoryHubSocket extends EventEmitter implements WebSocketLike, HubSocketCo
     if (typeof data !== "string") return;
     const frame = JSON.parse(data) as { type: "session"; message: SessionOutboundMessage };
     this.sent.push(frame.message);
-    this.messageObserved.resolve();
+    const observed = this.messageObserved;
+    this.messageObserved = deferred<void>();
+    observed.resolve();
   }
 
   close(code = 1000): void {
@@ -192,7 +194,6 @@ class MemoryHubSocket extends EventEmitter implements WebSocketLike, HubSocketCo
       );
       if (message) return message;
       await this.messageObserved.promise;
-      this.messageObserved = deferred<void>();
     }
   }
 
@@ -203,7 +204,6 @@ class MemoryHubSocket extends EventEmitter implements WebSocketLike, HubSocketCo
       const message = this.sent.find(predicate);
       if (message) return message;
       await this.messageObserved.promise;
-      this.messageObserved = deferred<void>();
     }
   }
 }
@@ -425,7 +425,7 @@ class InMemoryHubRelationships implements HubRelationshipRemote {
   }
 }
 
-interface CliProcess {
+interface RelationshipOperation {
   result: Promise<Record<string, unknown>>;
 }
 
@@ -440,7 +440,7 @@ type AcceptedCreate = Omit<
 
 const providerCatalog = {
   async resolveCreateConfig(input) {
-    return { modeId: input.requestedMode, featureValues: input.featureValues };
+    return { modeId: input.requestedMode, providerOptions: input.providerOptions };
   },
 } satisfies CreateAgentCommandDependencies["providerSnapshotManager"];
 
@@ -454,7 +454,7 @@ export class HubRelationshipHarness {
   private host = "";
   private readonly logs: string[] = [];
   private readonly providerPrompts: AgentPromptInput[] = [];
-  private readonly cliProcesses = new Set<Promise<unknown>>();
+  private readonly operations = new Set<Promise<unknown>>();
   private readonly claimedCliSockets = new Set<WebSocket>();
   private readonly promptsToFail = new Set<string>();
   private failNextSessionClose = false;
@@ -514,37 +514,44 @@ export class HubRelationshipHarness {
     this.remote.holdEnrollment();
   }
 
-  beginConnect(token = "ceremony-token", hubUrl = HUB_ORIGIN, execute = true): CliProcess {
+  beginConnect(
+    token = "ceremony-token",
+    hubUrl = HUB_ORIGIN,
+    execute = true,
+  ): RelationshipOperation {
     return {
-      result: this.runCli([
-        "hub",
-        "connect",
-        hubUrl,
-        "--api-key",
-        `hub-contract-api-key:${token}`,
-        ...(execute ? ["--permission", "hub.execute"] : []),
-      ]),
+      result: this.withClient(
+        async (client) =>
+          (await client.connectHub(hubUrl, token, execute ? ["hub.execute"] : [])).status,
+      ),
     };
   }
 
   async status(): Promise<Record<string, unknown>> {
-    return this.runCli(["hub", "status"]);
+    return this.withClient(async (client) => (await client.getHubStatus()).status);
   }
 
   async disconnect(force = false): Promise<Record<string, unknown>> {
-    return this.runCli(["hub", "disconnect", ...(force ? ["--force"] : [])]);
+    return this.withClient(async (client) => {
+      const { status, warning } = await client.disconnectHub(force);
+      return { ...status, ...(warning ? { warning } : {}) };
+    });
   }
 
   async grantPermission(permission: string): Promise<Record<string, unknown>> {
-    return this.runCli(["hub", "permissions", "grant", permission]);
+    return this.withClient(
+      async (client) => (await client.updateHubPermissions({ grant: [permission] })).status,
+    );
   }
 
   async revokePermission(permission: string): Promise<Record<string, unknown>> {
-    return this.runCli(["hub", "permissions", "revoke", permission]);
+    return this.withClient(
+      async (client) => (await client.updateHubPermissions({ revoke: [permission] })).status,
+    );
   }
 
-  beginDisconnect(force = false): CliProcess {
-    return { result: this.runCli(["hub", "disconnect", ...(force ? ["--force"] : [])]) };
+  beginDisconnect(force = false): RelationshipOperation {
+    return { result: this.disconnect(force) };
   }
 
   async relationshipStateBecomes(expected: string | null): Promise<void> {
@@ -728,6 +735,16 @@ export class HubRelationshipHarness {
     socket.socket.close(code);
   }
 
+  async requestOrdinary(message: {
+    type: string;
+    requestId: string;
+    [key: string]: unknown;
+  }): Promise<SessionOutboundMessage> {
+    const socket = this.latestSocket().socket;
+    socket.receive(message);
+    return socket.messageFor(message.requestId);
+  }
+
   sendHubRequestOnLatest(message: unknown): SessionOutboundMessage[] {
     const socket = this.latestSocket().socket;
     socket.receive(message);
@@ -823,7 +840,7 @@ export class HubRelationshipHarness {
   }
 
   async durableOwnedAgentIds(): Promise<string[]> {
-    return (await this.daemon!.agentStorage.list())
+    return (await this.daemon!.agentStorage.listAll())
       .filter((record) => record.owner?.kind === "daemon")
       .map((record) => record.id);
   }
@@ -833,7 +850,7 @@ export class HubRelationshipHarness {
       path.join(this.paseoHome, "agents"),
       pino({ level: "silent" }),
     );
-    return (await storage.list())
+    return (await storage.listAll())
       .filter((record) => record.owner?.kind === "daemon")
       .map((record) => record.id);
   }
@@ -1255,7 +1272,7 @@ export class HubRelationshipHarness {
     });
     const executions = this.executionsForReconstruction(manager, storage);
     const replay = await executions.create(this.ownedCreateInput(executionId));
-    const durableAgentCount = (await storage.list()).filter(
+    const durableAgentCount = (await storage.listAll()).filter(
       (record) => record.owner?.kind === "daemon",
     ).length;
     return { replay, durableAgentCount };
@@ -1268,8 +1285,9 @@ export class HubRelationshipHarness {
       pino({ level: "silent" }),
     );
     return {
-      durableAgentCount: (await storage.list()).filter((record) => record.owner?.kind === "daemon")
-        .length,
+      durableAgentCount: (await storage.listAll()).filter(
+        (record) => record.owner?.kind === "daemon",
+      ).length,
     };
   }
 
@@ -1362,7 +1380,7 @@ export class HubRelationshipHarness {
 
   async close(): Promise<void> {
     await this.stopDaemon();
-    await Promise.allSettled(this.cliProcesses);
+    await Promise.allSettled(this.operations);
     await Promise.all(
       [...this.claimedCliSockets].map((socket) => this.closeClaimedCliSocket(socket)),
     );
@@ -1423,8 +1441,21 @@ export class HubRelationshipHarness {
     this.daemon = null;
   }
 
-  private runCli(args: string[]): Promise<Record<string, unknown>> {
-    return this.trackCli(this.executeCli(args));
+  private withClient<T>(action: (client: DaemonClient) => Promise<T>): Promise<T> {
+    return this.trackOperation(
+      (async () => {
+        const client = await this.trustedClient();
+        try {
+          return await action(client);
+        } finally {
+          await client.close();
+        }
+      })(),
+    );
+  }
+
+  runCli(args: string[]): Promise<Record<string, unknown>> {
+    return this.trackOperation(this.executeCli(args));
   }
 
   private async executeCli(args: string[]): Promise<Record<string, unknown>> {
@@ -1448,11 +1479,11 @@ export class HubRelationshipHarness {
     return parsed as Record<string, unknown>;
   }
 
-  private trackCli<T>(process: Promise<T>): Promise<T> {
-    this.cliProcesses.add(process);
+  private trackOperation<T>(process: Promise<T>): Promise<T> {
+    this.operations.add(process);
     void process.then(
-      () => this.cliProcesses.delete(process),
-      () => this.cliProcesses.delete(process),
+      () => this.operations.delete(process),
+      () => this.operations.delete(process),
     );
     return process;
   }
@@ -1572,7 +1603,6 @@ export class HubRelationshipHarness {
       appVersion: "0.1.106",
     });
     await client.connect();
-    await client.fetchAgents({ subscribe: { subscriptionId: "hub-relationship-trusted" } });
     return client;
   }
 

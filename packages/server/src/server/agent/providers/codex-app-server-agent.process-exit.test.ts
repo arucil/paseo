@@ -11,6 +11,7 @@ import type {
   AgentLaunchContext,
   AgentSession,
   AgentSessionConfig,
+  AgentStreamEvent,
 } from "../agent-sdk-types.js";
 import { CodexAppServerAgentClient, CodexAppServerAgentSession } from "./codex-app-server-agent.js";
 import {
@@ -19,6 +20,87 @@ import {
 } from "./codex/test-utils/fake-app-server.js";
 
 const logger = createTestLogger();
+
+interface PendingPlanLifecycle {
+  close(): Promise<void>;
+  crashDuringActiveTurn(): Promise<void>;
+  expectCanceledPlan(): void;
+}
+
+async function withPendingPlan(
+  runScenario: (plan: PendingPlanLifecycle) => Promise<void>,
+): Promise<void> {
+  const workdir = mkdtempSync(join(tmpdir(), "codex-plan-cancel-"));
+  const appServer = createFakeCodexAppServer();
+  const client = new ProcessExitCodexClient([appServer]);
+  const session = await client.createSession({
+    provider: "codex",
+    cwd: workdir,
+    modeId: "auto",
+    model: "gpt-5.4",
+    providerOptions: { plan_mode: true },
+  });
+  const events: AgentStreamEvent[] = [];
+  session.subscribe((event) => events.push(event));
+  try {
+    const run = session.run("make a plan");
+    await appServer.waitForTurnStart();
+    appServer.startsTurn({ threadId: "thread-1", turnId: "plan-turn" });
+    appServer.updatesPlan({ threadId: "thread-1", steps: ["Inspect README"] });
+    appServer.completeTurn();
+    await run;
+    const proposal = events.find(
+      (event) =>
+        event.type === "timeline" &&
+        event.item.type === "tool_call" &&
+        event.item.name === "plan_approval",
+    );
+    expect(proposal).toBeDefined();
+    const [request] = session.getPendingPermissions?.() ?? [];
+    expect(request).toBeDefined();
+    await runScenario({
+      close: () => session.close(),
+      async crashDuringActiveTurn() {
+        appServer.startsTurn({ threadId: "thread-1", turnId: "autonomous-turn" });
+        await expect
+          .poll(() => events.filter((event) => event.type === "turn_started").length)
+          .toBe(2);
+        appServer.child.emit("exit", 17, null);
+        await expect.poll(() => events.some((event) => event.type === "turn_failed")).toBe(true);
+      },
+      expectCanceledPlan() {
+        expect(session.getPendingPermissions?.()).toEqual([]);
+        expect(events).toContainEqual({
+          ...proposal,
+          item: expect.objectContaining({
+            type: "tool_call",
+            name: "plan_approval",
+            callId: request?.id,
+            status: "canceled",
+            detail: { type: "plan", text: "- Inspect README" },
+          }),
+        });
+      },
+    });
+  } finally {
+    await session.close();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+}
+
+test("closing a session retains a canceled pending plan", async () => {
+  await withPendingPlan(async (plan) => {
+    await plan.close();
+    plan.expectCanceledPlan();
+  });
+});
+
+test("an active provider crash retains a canceled pending plan", async () => {
+  await withPendingPlan(async (plan) => {
+    await plan.crashDuringActiveTurn();
+    plan.expectCanceledPlan();
+  });
+});
 
 class ProcessExitCodexClient extends CodexAppServerAgentClient implements AgentClient {
   constructor(private readonly appServers: FakeCodexAppServer[]) {
@@ -444,7 +526,7 @@ test("idle provider exit preserves a synthetic plan approval across reconnect", 
         cwd: workdir,
         modeId: "auto",
         model: "gpt-5.4",
-        featureValues: { plan_mode: true },
+        providerOptions: { plan_mode: true },
       },
       undefined,
       { workspaceId: undefined },
@@ -505,6 +587,10 @@ test("concurrent session APIs share one reconnect after an idle provider exit", 
     createFakeCodexAppServer(),
   ];
   let spawnCount = 0;
+  let markReconnectStarted!: () => void;
+  const reconnectStarted = new Promise<void>((resolve) => {
+    markReconnectStarted = resolve;
+  });
   let releaseReconnect: (() => void) | undefined;
   const reconnectGate = new Promise<void>((resolve) => {
     releaseReconnect = resolve;
@@ -520,6 +606,7 @@ test("concurrent session APIs share one reconnect after an idle provider exit", 
       }
       spawnCount += 1;
       if (spawnCount > 1) {
+        markReconnectStarted();
         await reconnectGate;
       }
       return appServer.child;
@@ -532,12 +619,14 @@ test("concurrent session APIs share one reconnect after an idle provider exit", 
 
     const runtimeInfo = session.getRuntimeInfo();
     const turnStart = session.startTurn("continue after reconnect");
+    await reconnectStarted;
     const reconnectSpawnCount = spawnCount - 1;
     releaseReconnect?.();
 
     await expect(runtimeInfo).resolves.toMatchObject({ provider: "codex" });
     await expect(turnStart).resolves.toMatchObject({ turnId: expect.any(String) });
     expect(reconnectSpawnCount).toBe(1);
+    expect(spawnCount).toBe(2);
   } finally {
     releaseReconnect?.();
     await session.close();

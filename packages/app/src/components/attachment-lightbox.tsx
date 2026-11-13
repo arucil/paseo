@@ -1,17 +1,20 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { Modal, Pressable, Text, View } from "react-native";
+import { useOverlayRegistration, type KeyboardInputEvent } from "@/keyboard";
+import { Modal } from "@/components/ui/modal";
+import { type ReactNode, useCallback, useEffect, useMemo, useState } from "react";
+import { Pressable, Text, View } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { StyleSheet } from "react-native-unistyles";
-import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { SafeAreaProvider, useSafeAreaInsets } from "react-native-safe-area-context";
 import { X } from "lucide-react-native";
 import { useTranslation } from "react-i18next";
 import type { AttachmentMetadata } from "@/attachments/types";
 import { useAttachmentPreviewUrl } from "@/attachments/use-attachment-preview-url";
-import { isNative, isWeb } from "@/constants/platform";
+import { isNative } from "@/constants/platform";
 import { SPACING } from "@/styles/theme";
 import { WindowChromeRootRegion } from "@/utils/desktop-window";
 import { ZoomableImage } from "@/components/zoomable-viewport/image";
 import type { ViewportSize } from "@/components/zoomable-viewport/geometry";
+import { useGlobalOverlayLayer } from "@/lib/overlay-root";
 
 export type ImageLightboxSource =
   | { type: "attachment"; metadata: AttachmentMetadata }
@@ -27,42 +30,34 @@ const LIGHTBOX_FIT = { padding: SPACING[4], maxWidth: 960, maxHeight: 640 };
 
 export function AttachmentLightbox({ source, onClose }: AttachmentLightboxProps) {
   const { t } = useTranslation();
-  const insets = useSafeAreaInsets();
   const metadata = source?.type === "attachment" ? source.metadata : null;
   const attachmentUrl = useAttachmentPreviewUrl(metadata);
   const url = source?.type === "uri" ? source.uri : attachmentUrl;
   const contentSize = source?.type === "uri" ? source.contentSize : undefined;
   const [errored, setErrored] = useState(false);
+  const modalLayer = useGlobalOverlayLayer("modal", source !== null);
 
   useEffect(() => {
     setErrored(false);
   }, [metadata?.id, url]);
 
-  useEffect(() => {
-    if (!isWeb || !source) return;
-    function handleKeydown(event: KeyboardEvent) {
-      if (event.key === "Escape") {
-        onClose();
-      }
-    }
-    window.addEventListener("keydown", handleKeydown);
-    return () => {
-      window.removeEventListener("keydown", handleKeydown);
-    };
-  }, [onClose, source]);
-
-  const contentLayerStyle = useMemo(
-    () => [
-      styles.contentLayer,
-      {
-        paddingTop: insets.top,
-        paddingRight: insets.right,
-        paddingBottom: insets.bottom,
-        paddingLeft: insets.left,
-      },
-    ],
-    [insets.bottom, insets.left, insets.right, insets.top],
+  const handleOverlayKeyDown = useCallback(
+    (event: KeyboardInputEvent) => {
+      if (event.key !== "Escape") return false;
+      event.preventDefault();
+      event.stopPropagation();
+      onClose();
+      return true;
+    },
+    [onClose],
   );
+  const setOverlayScope = useOverlayRegistration({
+    keys: ["Escape"],
+    active: source !== null,
+    layer: modalLayer,
+    onKeyDown: handleOverlayKeyDown,
+  });
+
   const actions = useMemo(
     () => [
       {
@@ -86,17 +81,19 @@ export function AttachmentLightbox({ source, onClose }: AttachmentLightboxProps)
   return (
     <Modal transparent animationType="fade" statusBarTranslucent visible onRequestClose={onClose}>
       <ModalRoot style={styles.root}>
-        <WindowChromeRootRegion corners="both">
-          <View style={styles.root}>
-            <Pressable
-              testID="attachment-lightbox-backdrop"
-              accessibilityRole="button"
-              accessibilityLabel={t("message.attachments.dismissImage")}
-              onPress={onClose}
-              style={styles.backdrop}
-            />
-            <View pointerEvents="box-none" style={contentLayerStyle}>
-              <View pointerEvents="box-none" style={styles.imageArea}>
+        {/* The modal is its own window: its insets are the window's, not the ones left where the
+            image was opened (inside a sheet tab, the bottom one is already spent). */}
+        <SafeAreaProvider>
+          <WindowChromeRootRegion corners="both">
+            <View ref={setOverlayScope} style={styles.root}>
+              <Pressable
+                testID="attachment-lightbox-backdrop"
+                accessibilityRole="button"
+                accessibilityLabel={t("message.attachments.dismissImage")}
+                onPress={onClose}
+                style={styles.backdrop}
+              />
+              <LightboxImageArea>
                 {hasError ? (
                   <Text style={styles.errorText}>{t("message.attachments.imageLoadFailed")}</Text>
                 ) : (
@@ -112,12 +109,35 @@ export function AttachmentLightbox({ source, onClose }: AttachmentLightboxProps)
                     uri={url}
                   />
                 )}
-              </View>
+              </LightboxImageArea>
             </View>
-          </View>
-        </WindowChromeRootRegion>
+          </WindowChromeRootRegion>
+        </SafeAreaProvider>
       </ModalRoot>
     </Modal>
+  );
+}
+
+function LightboxImageArea({ children }: { children: ReactNode }) {
+  const insets = useSafeAreaInsets();
+  const style = useMemo(
+    () => [
+      styles.contentLayer,
+      {
+        paddingTop: insets.top,
+        paddingRight: insets.right,
+        paddingBottom: insets.bottom,
+        paddingLeft: insets.left,
+      },
+    ],
+    [insets.bottom, insets.left, insets.right, insets.top],
+  );
+  return (
+    <View pointerEvents="box-none" style={style}>
+      <View pointerEvents="box-none" style={styles.imageArea}>
+        {children}
+      </View>
+    </View>
   );
 }
 

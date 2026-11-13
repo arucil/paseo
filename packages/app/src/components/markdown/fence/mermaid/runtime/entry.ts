@@ -40,6 +40,9 @@ function initializeMermaid(colorScheme: "light" | "dark"): void {
     ],
     flowchart: { htmlLabels: false },
     class: { htmlLabels: false },
+    // A gantt chart takes the width of the element it renders in, which is the oversized staging
+    // container. Keep it as wide as this frame, which on native is the message column.
+    gantt: { useWidth: document.body.clientWidth },
   });
 }
 
@@ -59,10 +62,53 @@ let pendingRender: MermaidRuntimeRenderMessage | null = null;
 let isRendering = false;
 let isDrainScheduled = false;
 
+interface DiagramSize {
+  height: number;
+  width: number;
+}
+
+/**
+ * Mermaid emits `width="100%"` with an inline `max-width` in pixels, so the diagram renders at
+ * its natural width and never fills a larger box. The host sizes this frame, so let the diagram
+ * follow the frame in both directions instead.
+ */
+function stretchToFrame(svg: SVGSVGElement): void {
+  svg.style.maxWidth = "100%";
+  svg.style.maxHeight = "100%";
+  svg.style.width = "100%";
+  svg.style.height = "100%";
+}
+
+/**
+ * The reported size is the host's content size, and the host feeds it back as this frame's size.
+ * Measuring the rendered box would make that a loop: every re-render lands in a frame the last
+ * measurement shrank by the container's padding, so a streaming diagram ratchets down to nothing.
+ * The viewBox is the diagram's own size and doesn't move.
+ */
+function measureDiagram(host: HTMLElement, svg: SVGSVGElement | null): DiagramSize {
+  const viewBox = svg?.viewBox.baseVal;
+  if (viewBox && viewBox.width > 0 && viewBox.height > 0) {
+    return { height: Math.ceil(viewBox.height), width: Math.ceil(viewBox.width) };
+  }
+  const rect = svg?.getBoundingClientRect();
+  return {
+    height: Math.ceil(rect?.height ?? host.scrollHeight),
+    width: Math.ceil(rect?.width ?? host.scrollWidth),
+  };
+}
+
 async function render(message: MermaidRuntimeRenderMessage): Promise<void> {
   try {
     initializeMermaid(message.colorScheme);
-    const { svg } = await mermaid.render(`paseo-mermaid-${message.revision}`, message.source);
+    const staging = document.getElementById("staging");
+    if (!staging) {
+      throw new Error("Missing Mermaid staging container");
+    }
+    const { svg } = await mermaid.render(
+      `paseo-mermaid-${message.revision}`,
+      message.source,
+      staging,
+    );
     if (message.revision !== latestRevision) {
       return;
     }
@@ -72,14 +118,18 @@ async function render(message: MermaidRuntimeRenderMessage): Promise<void> {
       return;
     }
     host.innerHTML = svg;
-    const rect = host.querySelector("svg")?.getBoundingClientRect();
+    const element = host.querySelector("svg");
+    if (element) {
+      stretchToFrame(element);
+    }
+    const size = measureDiagram(host, element);
     sendToHost({
       type: "rendered",
       revision: message.revision,
       source: message.source,
       colorScheme: message.colorScheme,
-      height: Math.ceil(rect?.height ?? host.scrollHeight),
-      width: Math.ceil(rect?.width ?? host.scrollWidth),
+      height: size.height,
+      width: size.width,
     });
   } catch {
     if (message.revision === latestRevision) {
