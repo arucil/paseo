@@ -4541,6 +4541,9 @@ export const WorkspaceDescriptorPayloadSchema = z
       .nullable()
       .optional(),
     scripts: z.array(WorkspaceScriptPayloadSchema).default([]),
+    // A directory bootstrap may contain only runtime script entries. The full
+    // configured list is fetched by the workspace screen on demand.
+    scriptsComplete: z.boolean().optional(),
     gitRuntime: WorkspaceGitRuntimePayloadSchema,
     // COMPAT(githubRuntimeName): legacy wire-field name now carries
     // forge-neutral runtime data. Introduce and migrate to a neutral

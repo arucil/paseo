@@ -109,6 +109,24 @@ describe("workspace message schemas", () => {
     expect(parsed.type).toBe("fetch_workspaces_request");
   });
 
+  test("accepts an incomplete runtime-only script projection", () => {
+    const parsed = WorkspaceDescriptorPayloadSchema.parse({
+      id: "workspace-runtime-scripts",
+      projectId: "project-1",
+      projectDisplayName: "project",
+      projectRootPath: "/repo",
+      workspaceDirectory: "/repo",
+      projectKind: "git",
+      workspaceKind: "local_checkout",
+      name: "main",
+      status: "running",
+      activityAt: null,
+      scripts: [],
+      scriptsComplete: false,
+    });
+    expect(parsed.scriptsComplete).toBe(false);
+  });
+
   test("parses project.add request and response", () => {
     expect(
       SessionInboundMessageSchema.parse({

@@ -79,6 +79,7 @@ class WorkspaceStatus {
     activity: TerminalActivity | null;
   }> = [];
   private readonly directory = new WorkspaceDirectory({
+    includeConfiguredScripts: () => false,
     logger: createTestLogger(),
     projectRegistry: { list: async () => [this.project] },
     workspaceRegistry: {
@@ -623,6 +624,7 @@ describe("WorkspaceDirectory empty projects", () => {
     workspaces: PersistedWorkspaceRecord[];
   }): WorkspaceDirectory {
     return new WorkspaceDirectory({
+      includeConfiguredScripts: () => false,
       logger: createTestLogger(),
       projectRegistry: { list: async () => input.projects },
       workspaceRegistry: {
@@ -784,6 +786,7 @@ test("Git observation targets exclude archived records without hydrating app des
     throw new Error("Watcher reconciliation hydrated app data");
   };
   const directory = new WorkspaceDirectory({
+    includeConfiguredScripts: () => false,
     logger: createTestLogger(),
     projectRegistry: { list: async () => [project("active"), project("archived", NOW)] },
     workspaceRegistry: {
@@ -955,6 +958,7 @@ test("scoped descriptor builds allocate independently of archived history", asyn
       isStoredProviderAvailable: () => true,
     });
     const directory = new WorkspaceDirectory({
+      includeConfiguredScripts: () => false,
       logger,
       workspaceRegistry: registry,
       projectRegistry: {
@@ -1027,29 +1031,177 @@ test("scoped descriptor builds allocate independently of archived history", asyn
   }
 }, 30000);
 
-test("shares an in-flight descriptor build across concurrent workspace fetches", async () => {
+test.each([
+  { workspaceCount: 1, agentCount: 1, fetchCount: 2 },
+  { workspaceCount: 200, agentCount: 300, fetchCount: 30 },
+])(
+  "coalesces workspace reads and releases failures ($workspaceCount workspaces, $agentCount agents, $fetchCount reads)",
+  async ({ workspaceCount, agentCount, fetchCount }) => {
+    const workspace: PersistedWorkspaceRecord = {
+      workspaceId: "workspace-concurrent",
+      projectId: "project-concurrent",
+      cwd: "/workspace/concurrent",
+      kind: "local_checkout",
+      displayName: "main",
+      createdAt: NOW,
+      updatedAt: NOW,
+      archivedAt: null,
+    };
+    const project: PersistedProjectRecord = {
+      projectId: "project-concurrent",
+      rootPath: workspace.cwd,
+      kind: "git",
+      displayName: "concurrent",
+      customName: null,
+      createdAt: NOW,
+      updatedAt: NOW,
+      archivedAt: null,
+    };
+    const workspaces = Array.from({ length: workspaceCount }, (_, index) => ({
+      ...workspace,
+      workspaceId: `workspace-${index}`,
+      cwd: `/workspace/concurrent-${index}`,
+      displayName: `workspace-${index}`,
+    }));
+    const agents = Array.from({ length: agentCount }, (_, index) => {
+      const record = workspaces[index % workspaces.length];
+      return createAgent({
+        id: `agent-${index}`,
+        status: "running",
+        workspaceId: record.workspaceId,
+        cwd: record.cwd,
+      });
+    });
+    let descriptorBuilds = 0;
+    let failBuild = false;
+    let includeConfiguredScripts = false;
+    let readScope = {};
+    const failure = new Error("workspace registry unavailable");
+    const directory = new WorkspaceDirectory({
+      includeConfiguredScripts: () => includeConfiguredScripts,
+      descriptorReadScope: () => readScope,
+      logger: createTestLogger(),
+      projectRegistry: { list: async () => [project] },
+      workspaceRegistry: {
+        listActive: async () => workspaces,
+        get: async (id) => workspaces.find((record) => record.workspaceId === id) ?? null,
+      },
+      listAgentPayloads: async () => agents,
+      workspaceLastUserMessageTimes: async () => new Map(),
+      listProviderSubagentActivity: async () => [],
+      listTerminalActivityContributions: async () => [],
+      isProviderVisibleToClient: () => true,
+      buildWorkspaceDescriptor: async ({
+        workspace: record,
+        includeConfiguredScripts: complete,
+      }) => {
+        descriptorBuilds += 1;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        if (failBuild) throw failure;
+        return {
+          id: record.workspaceId,
+          projectId: record.projectId,
+          projectDisplayName: project.displayName,
+          projectCustomName: null,
+          projectRootPath: project.rootPath,
+          workspaceDirectory: record.cwd,
+          projectKind: "git",
+          workspaceKind: record.kind,
+          background: false,
+          name: record.displayName,
+          title: null,
+          pinnedAt: null,
+          archivingAt: null,
+          status: "done",
+          statusEnteredAt: NOW,
+          activityAt: null,
+          createdAt: NOW,
+          diffStat: null,
+          scripts: [],
+          scriptsComplete: complete,
+          gitRuntime: null,
+          githubRuntime: null,
+        };
+      },
+    });
+
+    const responses = await Promise.all(
+      Array.from({ length: fetchCount }, (_, index) =>
+        directory.listFetchEntries({
+          type: "fetch_workspaces_request",
+          requestId: `fetch-${index}`,
+        }),
+      ),
+    );
+
+    expect(descriptorBuilds).toBe(workspaceCount);
+    for (const response of responses) {
+      expect(response.entries.map((entry) => entry.id).sort()).toEqual(
+        workspaces.map((record) => record.workspaceId).sort(),
+      );
+      expect(response.entries.map((entry) => entry.status)).toEqual(
+        Array.from({ length: workspaceCount }, () => "running"),
+      );
+    }
+
+    failBuild = true;
+    expect(
+      await Promise.allSettled([directory.listDescriptors(), directory.listDescriptors()]),
+    ).toEqual([
+      { status: "rejected", reason: failure },
+      { status: "rejected", reason: failure },
+    ]);
+    expect(descriptorBuilds).toBe(workspaceCount * 2);
+
+    failBuild = false;
+    expect(await directory.listDescriptors()).toHaveLength(workspaceCount);
+    expect(descriptorBuilds).toBe(workspaceCount * 3);
+
+    const runtimeOnly = directory.listDescriptors();
+    includeConfiguredScripts = true;
+    const full = directory.listDescriptors();
+    const [runtimeDescriptors, fullDescriptors] = await Promise.all([runtimeOnly, full]);
+    expect(runtimeDescriptors.map((entry) => entry.scriptsComplete)).toEqual(
+      Array.from({ length: workspaceCount }, () => false),
+    );
+    expect(fullDescriptors.map((entry) => entry.scriptsComplete)).toEqual(
+      Array.from({ length: workspaceCount }, () => true),
+    );
+    expect(descriptorBuilds).toBe(workspaceCount * 5);
+
+    const firstSource = directory.listDescriptors();
+    readScope = {};
+    const secondSource = directory.listDescriptors();
+    await Promise.all([firstSource, secondSource]);
+    expect(descriptorBuilds).toBe(workspaceCount * 7);
+  },
+);
+
+test("omits configured scripts from directory bootstrap reads", async () => {
   const workspace: PersistedWorkspaceRecord = {
-    workspaceId: "workspace-concurrent",
-    projectId: "project-concurrent",
-    cwd: "/workspace/concurrent",
+    workspaceId: "workspace-scripts",
+    projectId: "project-scripts",
+    cwd: "/workspace/scripts",
     kind: "local_checkout",
-    displayName: "main",
+    displayName: "scripts",
     createdAt: NOW,
     updatedAt: NOW,
     archivedAt: null,
   };
   const project: PersistedProjectRecord = {
-    projectId: "project-concurrent",
+    projectId: workspace.projectId,
     rootPath: workspace.cwd,
     kind: "git",
-    displayName: "concurrent",
+    displayName: "scripts",
     customName: null,
+    customIconRevision: null,
     createdAt: NOW,
     updatedAt: NOW,
     archivedAt: null,
   };
-  let descriptorBuilds = 0;
+  const includeConfiguredScripts: boolean[] = [];
   const directory = new WorkspaceDirectory({
+    includeConfiguredScripts: () => false,
     logger: createTestLogger(),
     projectRegistry: { list: async () => [project] },
     workspaceRegistry: {
@@ -1061,9 +1213,8 @@ test("shares an in-flight descriptor build across concurrent workspace fetches",
     listProviderSubagentActivity: async () => [],
     listTerminalActivityContributions: async () => [],
     isProviderVisibleToClient: () => true,
-    buildWorkspaceDescriptor: async ({ workspace: record }) => {
-      descriptorBuilds += 1;
-      await new Promise<void>((resolve) => setImmediate(resolve));
+    buildWorkspaceDescriptor: async ({ workspace: record, includeConfiguredScripts: scripts }) => {
+      includeConfiguredScripts.push(scripts !== false);
       return {
         id: record.workspaceId,
         projectId: record.projectId,
@@ -1081,7 +1232,8 @@ test("shares an in-flight descriptor build across concurrent workspace fetches",
         status: "done",
         statusEnteredAt: NOW,
         activityAt: null,
-        createdAt: NOW,
+        createdAt: record.createdAt,
+        lastUserMessageAt: null,
         diffStat: null,
         scripts: [],
         gitRuntime: null,
@@ -1090,12 +1242,11 @@ test("shares an in-flight descriptor build across concurrent workspace fetches",
     },
   });
 
-  const [first, second] = await Promise.all([
-    directory.listFetchEntries({ type: "fetch_workspaces_request", requestId: "first" }),
-    directory.listFetchEntries({ type: "fetch_workspaces_request", requestId: "second" }),
-  ]);
+  await directory.listFetchEntries({ type: "fetch_workspaces_request", requestId: "scripts" });
+  await directory.buildDescriptorMap({
+    includeGitData: false,
+    workspaceIds: [workspace.workspaceId],
+  });
 
-  expect(descriptorBuilds).toBe(1);
-  expect(first.entries.map((entry) => entry.id)).toEqual([workspace.workspaceId]);
-  expect(second.entries.map((entry) => entry.id)).toEqual([workspace.workspaceId]);
+  expect(includeConfiguredScripts).toEqual([false, false]);
 });

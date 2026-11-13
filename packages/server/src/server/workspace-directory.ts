@@ -69,6 +69,8 @@ export type ProviderSubagentWorkspaceActivity = Pick<
 >;
 
 export interface WorkspaceDirectoryDeps {
+  includeConfiguredScripts: () => boolean;
+  descriptorReadScope?: () => object;
   logger: pino.Logger;
   projectRegistry: {
     list(): Promise<PersistedProjectRecord[]>;
@@ -90,6 +92,7 @@ export interface WorkspaceDirectoryDeps {
     workspace: PersistedWorkspaceRecord;
     projectRecord?: PersistedProjectRecord | null;
     includeGitData: boolean;
+    includeConfiguredScripts: boolean;
   }): Promise<WorkspaceDescriptorPayload>;
 }
 
@@ -171,10 +174,12 @@ function activeWorkspaceRecords(
 
 export class WorkspaceDirectory {
   private readonly archivingByWorkspaceId = new Map<string, string>();
-  // A GUI can reconnect or replay its bootstrap while the previous request is
-  // still building descriptors. Share only the in-flight read: a completed
-  // result must not become a stale workspace cache.
-  private descriptorMapPromise: Promise<Map<string, WorkspaceDescriptorPayload>> | null = null;
+  // Share in-flight reads within the same source and script projection. A
+  // completed read must not become a stale workspace cache.
+  private readonly descriptorMapPromises = new Map<
+    object,
+    Map<boolean, Promise<Map<string, WorkspaceDescriptorPayload>>>
+  >();
   /**
    * Per-workspace last-seen winning bucket + entered-at. Persists across
    * `buildDescriptorMap` calls inside the daemon process; reset on cold start.
@@ -222,8 +227,11 @@ export class WorkspaceDirectory {
 
   async buildDescriptorMap(options: {
     includeGitData: boolean;
+    includeConfiguredScripts?: boolean;
     workspaceIds?: Iterable<string>;
   }): Promise<Map<string, WorkspaceDescriptorPayload>> {
+    const includeConfiguredScripts =
+      options.includeConfiguredScripts ?? this.deps.includeConfiguredScripts();
     const requestedIds = options.workspaceIds ? new Set(options.workspaceIds) : undefined;
     const [
       agents,
@@ -267,6 +275,8 @@ export class WorkspaceDirectory {
           workspace,
           projectRecord: activeProjects.get(workspace.projectId) ?? null,
           includeGitData: options.includeGitData,
+          // Configured scripts load on demand; directory projections only need runtime state.
+          includeConfiguredScripts,
         }),
       ),
     );
@@ -629,10 +639,25 @@ export class WorkspaceDirectory {
   // Every active workspace, background ones included. Callers that answer a
   // listing go through matchesFilter so background workspaces stay opt-in.
   async listDescriptors(): Promise<WorkspaceDescriptorPayload[]> {
-    this.descriptorMapPromise ??= this.buildDescriptorMap({ includeGitData: true }).finally(() => {
-      this.descriptorMapPromise = null;
-    });
-    const descriptors = await this.descriptorMapPromise;
+    const includeConfiguredScripts = this.deps.includeConfiguredScripts();
+    const scope = this.deps.descriptorReadScope?.() ?? this.deps;
+    let builds = this.descriptorMapPromises.get(scope);
+    if (!builds) {
+      builds = new Map();
+      this.descriptorMapPromises.set(scope, builds);
+    }
+    const scopedBuilds = builds;
+    let pending = scopedBuilds.get(includeConfiguredScripts);
+    if (!pending) {
+      pending = this.buildDescriptorMap({ includeGitData: true, includeConfiguredScripts }).finally(
+        () => {
+          scopedBuilds.delete(includeConfiguredScripts);
+          if (scopedBuilds.size === 0) this.descriptorMapPromises.delete(scope);
+        },
+      );
+      scopedBuilds.set(includeConfiguredScripts, pending);
+    }
+    const descriptors = await pending;
     return Array.from(descriptors.values());
   }
 

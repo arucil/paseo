@@ -30,6 +30,10 @@ import type { PaseoServicePortAllocation } from "@getpaseo/protocol/paseo-config
 
 type WorkspaceScriptsPayload = WorkspaceDescriptorPayload["scripts"];
 
+interface WorkspaceScriptsSnapshotOptions {
+  includeConfiguredScripts?: boolean;
+}
+
 /**
  * The service-proxy-backed scripts a workspace exposes: build the scripts payload
  * snapshot, publish a script_status_update to every client, and start a script.
@@ -43,6 +47,7 @@ export interface WorkspaceScriptsService {
   buildSnapshot(
     workspace: PersistedWorkspaceRecord,
     project?: PersistedProjectRecord | null,
+    options?: WorkspaceScriptsSnapshotOptions,
   ): Promise<WorkspaceScriptsPayload>;
   emitStatusUpdate(workspaceId: string, workspaceDirectory: string): Promise<void>;
   list(workspaceId: string): Promise<WorkspaceScriptPayload[]>;
@@ -113,6 +118,7 @@ export function createWorkspaceScriptsService(deps: {
   async function buildSnapshot(
     workspace: PersistedWorkspaceRecord,
     project: PersistedProjectRecord | null = null,
+    options: WorkspaceScriptsSnapshotOptions = {},
   ): Promise<WorkspaceScriptsPayload> {
     if (!serviceProxy || !scriptRuntimeStore) {
       return [];
@@ -120,7 +126,10 @@ export function createWorkspaceScriptsService(deps: {
     return buildWorkspaceScriptPayloads({
       workspaceId: workspace.workspaceId,
       workspaceDirectory: workspace.cwd,
-      paseoConfig: await readPaseoConfigForProjection(workspace.cwd, logger),
+      paseoConfig:
+        options.includeConfiguredScripts === false
+          ? null
+          : await readPaseoConfigForProjection(workspace.cwd, logger),
       serviceProxy,
       runtimeStore: scriptRuntimeStore,
       daemonPort: getDaemonTcpPort?.() ?? null,

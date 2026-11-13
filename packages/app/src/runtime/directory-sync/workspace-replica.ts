@@ -65,7 +65,7 @@ export class WorkspaceDirectoryReplica {
   ): void {
     if (shouldSuppressWorkspaceForLocalArchive({ serverId: this.serverId, workspace })) return;
     if (project) this.setProject(project);
-    this.setWorkspace(workspace);
+    this.setWorkspace(mergeWorkspaceScripts(workspace, this.workspaces.get(workspace.id)));
   }
 
   commitSnapshot(
@@ -105,7 +105,10 @@ export class WorkspaceDirectoryReplica {
     const workspaces = new Map<string, WorkspaceDescriptor>();
     for (const [workspaceId, workspace] of snapshot.workspaces) {
       if (!shouldSuppressWorkspaceForLocalArchive({ serverId: this.serverId, workspace })) {
-        workspaces.set(workspaceId, workspace);
+        workspaces.set(
+          workspaceId,
+          mergeWorkspaceScripts(workspace, this.workspaces.get(workspaceId)),
+        );
       }
     }
     // A snapshot taken while an undo runs can predate the restore; the host publishes the row.
@@ -134,8 +137,13 @@ export class WorkspaceDirectoryReplica {
       workspaceId: update.workspaceId,
     });
     const workspace = workspaceId ? this.workspaces.get(workspaceId) : undefined;
-    if (!workspace || equal(workspace.scripts, update.scripts)) return [];
-    const next = { ...workspace, scripts: update.scripts.map((script) => ({ ...script })) };
+    if (!workspace) return [];
+    if (workspace.scriptsComplete !== false && equal(workspace.scripts, update.scripts)) return [];
+    const next = {
+      ...workspace,
+      scripts: update.scripts.map((script) => ({ ...script })),
+      scriptsComplete: true,
+    };
     this.setWorkspace(next);
     return [{ kind: "workspace", type: "upsert", id: next.id, value: next }];
   }
@@ -216,8 +224,9 @@ export class WorkspaceDirectoryReplica {
       this.deleteWorkspace(workspace.id);
       return [{ kind: "workspace", type: "delete", id: workspace.id }];
     }
-    this.setWorkspace(workspace);
-    return [{ kind: "workspace", type: "upsert", id: workspace.id, value: workspace }];
+    const next = mergeWorkspaceScripts(workspace, this.workspaces.get(workspace.id));
+    this.setWorkspace(next);
+    return [{ kind: "workspace", type: "upsert", id: next.id, value: next }];
   }
 
   private applySetupStatus(workspace: WorkspaceDescriptor): void {
@@ -261,4 +270,27 @@ export class WorkspaceDirectoryReplica {
       this.workspaceIdsByProject.set(workspace.projectId, workspaceIds);
     }
   }
+}
+
+function mergeWorkspaceScripts(
+  incoming: WorkspaceDescriptor,
+  existing: WorkspaceDescriptor | undefined,
+): WorkspaceDescriptor {
+  if (incoming.scriptsComplete !== false || !existing || existing.scriptsComplete === false)
+    return incoming;
+
+  const scriptsByName = new Map(existing.scripts.map((script) => [script.scriptName, script]));
+  for (const script of incoming.scripts) {
+    scriptsByName.set(script.scriptName, script);
+  }
+  return {
+    ...incoming,
+    scripts: Array.from(scriptsByName.values()).sort((left, right) =>
+      left.scriptName.localeCompare(right.scriptName, undefined, {
+        numeric: true,
+        sensitivity: "base",
+      }),
+    ),
+    scriptsComplete: true,
+  };
 }

@@ -137,6 +137,7 @@ export interface WorkspaceDescriptor {
   archivingAt: string | null;
   diffStat: { additions: number; deletions: number } | null;
   scripts: WorkspaceDescriptorPayload["scripts"];
+  scriptsComplete?: boolean;
   gitRuntime?: WorkspaceDescriptorPayload["gitRuntime"];
   githubRuntime?: WorkspaceDescriptorPayload["githubRuntime"];
   forge?: WorkspaceDescriptorPayload["forge"];
@@ -183,6 +184,8 @@ export function normalizeWorkspaceDescriptor(
     archivingAt: payload.archivingAt ?? null,
     diffStat: payload.diffStat ?? null,
     scripts: (payload.scripts ?? []).map((s) => Object.assign({}, s)),
+    // COMPAT(workspaceRuntimeScripts): v0.16.0, remove after 2027-05-14 once daemon floor >= v0.16.0.
+    scriptsComplete: payload.scriptsComplete !== false,
     gitRuntime: payload.gitRuntime,
     githubRuntime: payload.githubRuntime,
     forge: payload.forge,
