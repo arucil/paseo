@@ -48,7 +48,11 @@ import type { StoredAgentRecord } from "./agent/agent-storage.js";
 import type { AgentManagerEvent } from "./agent/agent-manager.js";
 import type { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import { WorkspaceLabelError, type WorkspaceLabelService } from "./workspace-labels/index.js";
-import { createPersistedProjectRecord } from "./workspace-registry.js";
+import {
+  createPersistedProjectRecord,
+  createPersistedWorkspaceRecord,
+} from "./workspace-registry.js";
+import type { WorkspaceDirectoryDeps } from "./workspace-directory.js";
 import { deriveProjectKey } from "./project-key.js";
 import type { SessionOptions } from "./session.js";
 import type { SessionInboundMessage, SessionOutboundMessage } from "./messages.js";
@@ -78,6 +82,7 @@ import type { CheckDetails, ForgeService } from "../services/forge-service.js";
 import type { GitHubPullRequestStatusFacts } from "../services/github-facts.js";
 
 interface SessionHandlerInternals {
+  buildWorkspaceDescriptor: WorkspaceDirectoryDeps["buildWorkspaceDescriptor"];
   interruptAgentIfRunning(agentId: string): Promise<void>;
   handleSendAgentMessage(
     agentId: string,
@@ -4401,6 +4406,42 @@ describe("session workspace descriptors", () => {
     expect(checkoutGitMocks.warmCheckoutShortstatInBackground).not.toHaveBeenCalled();
     expect(descriptor.diffStat).toEqual({ additions: 7, deletions: 2 });
   });
+
+  test.each([false, true])(
+    "negotiates runtime-only script descriptors (capability: %s)",
+    async (supported) => {
+      const createdAt = "2026-11-14T00:00:00.000Z";
+      const workspace = createPersistedWorkspaceRecord({
+        workspaceId: "workspace-runtime-scripts",
+        projectId: "project-runtime-scripts",
+        cwd: "/tmp/runtime-scripts",
+        kind: "directory",
+        displayName: "scripts",
+        createdAt,
+        updatedAt: createdAt,
+      });
+      const project = createPersistedProjectRecord({
+        projectId: workspace.projectId,
+        rootPath: workspace.cwd,
+        kind: "non_git",
+        displayName: "scripts",
+        createdAt,
+        updatedAt: createdAt,
+      });
+      const session = createSessionForTest({
+        clientCapabilities: { [CLIENT_CAPS.workspaceRuntimeScripts]: supported },
+      });
+
+      const descriptor = await asSessionInternals(session).buildWorkspaceDescriptor({
+        workspace,
+        projectRecord: project,
+        includeGitData: false,
+        includeConfiguredScripts: false,
+      });
+
+      expect(descriptor.scriptsComplete === false).toBe(supported);
+    },
+  );
 
   test("does not cold-load git data while describing a workspace", async () => {
     const workspaceRuntimeStore = { ...createWorkspaceRuntimeStore(), get: vi.fn(() => null) };

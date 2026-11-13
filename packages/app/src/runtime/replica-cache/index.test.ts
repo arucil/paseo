@@ -369,6 +369,24 @@ describe("ReplicaCache", () => {
     expect(restored.workspaces.get(workspace.id)?.forgeWeb).toEqual(forgeWeb);
   });
 
+  it("preserves an incomplete runtime-only script projection across cache reopen", async () => {
+    const storage = new MemoryStorage();
+    const writer = createCache(storage);
+    const baseline = directory();
+    const workspace = normalizeWorkspaceDescriptor({
+      ...workspacePayload(),
+      scripts: [],
+      scriptsComplete: false,
+    });
+    baseline.workspaces.set(workspace.id, workspace);
+    commitDirectory(writer, SERVER_ID, baseline);
+    await writer.flush();
+
+    const restored = await createCache(storage).readDirectory(SERVER_ID);
+
+    expect(restored.workspaces.get(workspace.id)?.scriptsComplete).toBe(false);
+  });
+
   it("preserves workspace sorting timestamps across cache reopen", async () => {
     const storage = new MemoryStorage();
     const writer = createCache(storage);

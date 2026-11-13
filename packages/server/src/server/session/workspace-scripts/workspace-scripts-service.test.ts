@@ -4,7 +4,9 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pino } from "pino";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
+import * as scriptStatusProjection from "../../script-status-projection.js";
+import { createPersistedWorkspaceRecord } from "../../workspace-registry.js";
 import type {
   ScriptStatusUpdateMessage,
   SessionOutboundMessage,
@@ -148,6 +150,7 @@ const request: StartWorkspaceScriptRequest = {
 
 const tempDirs: string[] = [];
 afterEach(() => {
+  vi.restoreAllMocks();
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop();
     if (dir) {
@@ -175,6 +178,88 @@ test("reads external service-port edits at the next launch without construction 
 });
 
 describe("buildSnapshot", () => {
+  test("projects running scripts without config IO and loads configured scripts on demand", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "workspace-scripts-runtime-"));
+    tempDirs.push(dir);
+    writeFileSync(
+      join(dir, "paseo.json"),
+      JSON.stringify({
+        scripts: {
+          web: { type: "service", command: "npm run web", port: 3000 },
+          check: { command: "npm test" },
+        },
+      }),
+    );
+    const workspace = createPersistedWorkspaceRecord({
+      workspaceId: "ws-runtime",
+      projectId: "project-runtime",
+      cwd: dir,
+      kind: "local_checkout",
+      displayName: "runtime",
+      createdAt: "2026-03-01T12:00:00.000Z",
+      updatedAt: "2026-03-01T12:00:00.000Z",
+    });
+    const runtimeStore = new WorkspaceScriptRuntimeStore();
+    for (const [scriptName, type] of [
+      ["web", "service"],
+      ["task", "script"],
+    ] as const) {
+      runtimeStore.set({
+        workspaceId: workspace.workspaceId,
+        scriptName,
+        type,
+        lifecycle: "running",
+        terminalId: `terminal-${scriptName}`,
+        exitCode: null,
+      });
+    }
+    const serviceProxy = createServiceProxySubsystem({ logger });
+    const identity = {
+      workspaceId: workspace.workspaceId,
+      projectSlug: "runtime",
+      branchName: "feature/scripts",
+      scriptName: "web",
+    };
+    serviceProxy.registerWorkspaceService({ ...identity, port: 3000 });
+    const serviceState = serviceProxy.projectWorkspaceServiceState({
+      ...identity,
+      daemonPort: 6767,
+    });
+    const { service } = buildService({ workspace, scriptRuntimeStore: runtimeStore, serviceProxy });
+    const readConfig = vi.spyOn(scriptStatusProjection, "readPaseoConfigForProjection");
+
+    const snapshot = await service.buildSnapshot(workspace, null, {
+      includeConfiguredScripts: false,
+    });
+
+    expect(readConfig).not.toHaveBeenCalled();
+    expect(
+      snapshot.map((script) => [
+        script.scriptName,
+        script.type,
+        script.lifecycle,
+        script.terminalId,
+      ]),
+    ).toEqual([
+      ["task", "script", "running", "terminal-task"],
+      ["web", "service", "running", "terminal-web"],
+    ]);
+    expect(snapshot.find((script) => script.scriptName === "web")).toMatchObject({
+      hostname: serviceState.hostname,
+      port: 3000,
+      localProxyUrl: serviceState.localProxyUrl,
+      proxyUrl: serviceState.proxyUrl,
+    });
+
+    const full = await service.list(workspace.workspaceId);
+    expect(readConfig).toHaveBeenCalledTimes(1);
+    expect(full.map((script) => [script.scriptName, script.lifecycle])).toEqual([
+      ["check", "stopped"],
+      ["task", "running"],
+      ["web", "running"],
+    ]);
+  });
+
   test("returns no scripts when the service proxy is unavailable", async () => {
     const { service } = buildService({ serviceProxy: null });
     expect(

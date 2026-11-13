@@ -46,6 +46,8 @@ export const CLIENT_CAPS = {
   // COMPAT(pluginTimelineItems): added in v0.8.0, remove after 2027-03-07 once client floor >= v0.8.0.
   pluginTimelineItems: "plugin_timeline_items",
   workspaceSetupObservation: "workspace_setup_observation",
+  // COMPAT(workspaceRuntimeScripts): v0.16.0, remove gate after 2027-05-14 once client floor >= v0.16.0.
+  workspaceRuntimeScripts: "workspace_runtime_scripts",
   // COMPAT(pluginBinaryPayloads): added in v0.15.0, remove after 2027-05-02 once client floor >= v0.15.0.
   // The daemon sends plugin RPC outputs as binary opcode 0x21 only to clients that decode it.
   pluginBinaryPayloads: "plugin_binary_payloads",

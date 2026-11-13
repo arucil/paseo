@@ -31,11 +31,16 @@ export interface AgentListItem {
   shortId: string;
   name: string;
   provider: string;
+  model: string | null;
   thinking: string;
+  mode: string;
   status: string;
   cwd: string;
   created: string;
   background: boolean;
+  archivedAt: string | null;
+  labels: Record<string, string>;
+  pendingPermissionCount: number;
 }
 
 /** Helper to get relative time string */
@@ -107,11 +112,16 @@ function toListItem(agent: AgentSnapshotPayload): AgentListItem {
     shortId: agent.id.slice(0, 7),
     name: agent.title ?? "-",
     provider: model ? `${agent.provider}/${model}` : agent.provider,
+    model,
     thinking: agent.effectiveThinkingOptionId ?? "auto",
+    mode: agent.currentModeId ?? "default",
     status: agent.status,
     cwd: shortenPath(agent.cwd),
     created: relativeTime(agent.createdAt),
     background: agent.background === true,
+    archivedAt: agent.archivedAt ?? null,
+    labels: agent.labels,
+    pendingPermissionCount: agent.pendingPermissions?.length ?? 0,
   };
 }
 

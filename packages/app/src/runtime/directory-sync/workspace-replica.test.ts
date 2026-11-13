@@ -35,6 +35,84 @@ function workspace(id: string, projectId = "project"): WorkspaceDescriptorPayloa
   };
 }
 
+it("retains complete script status across runtime-only directory updates and refreshes", () => {
+  const serverId = "workspace-script-snapshots";
+  const store = useSessionStore.getState();
+  store.initializeSession(serverId, null);
+  const replica = new WorkspaceDirectoryReplica(serverId);
+  const descriptor = workspace("scripts");
+  const scripts: WorkspaceDescriptorPayload["scripts"] = [
+    {
+      scriptName: "check",
+      type: "script",
+      hostname: "check",
+      port: null,
+      proxyUrl: null,
+      lifecycle: "stopped",
+      health: null,
+      exitCode: null,
+      terminalId: null,
+    },
+  ];
+  replica.acceptWorkspaces([normalizeWorkspaceDescriptor(descriptor)]);
+  replica.applyDelta({ kind: "script_status", update: { workspaceId: descriptor.id, scripts } });
+  const runtimeScript: WorkspaceDescriptorPayload["scripts"][number] = {
+    scriptName: "worker",
+    type: "script",
+    hostname: "worker",
+    port: null,
+    proxyUrl: null,
+    lifecycle: "running",
+    health: null,
+    exitCode: null,
+    terminalId: "terminal-worker",
+  };
+  const runtimeDescriptor = { ...descriptor, scripts: [runtimeScript], scriptsComplete: false };
+  const partial = normalizeWorkspaceDescriptor(runtimeDescriptor);
+
+  replica.applyDelta({
+    kind: "upsert",
+    workspace: { ...runtimeDescriptor, title: "updated" },
+  });
+  expect(replica.snapshot().workspaces.get(descriptor.id)?.scripts).toEqual([
+    ...scripts,
+    runtimeScript,
+  ]);
+  expect(replica.snapshot().workspaces.get(descriptor.id)?.title).toBe("updated");
+
+  replica.commitSnapshot({ workspaces: new Map([[partial.id, partial]]), projects: new Map() }, []);
+  expect(
+    useSessionStore.getState().sessions[serverId]?.workspaces.get(descriptor.id)?.scripts,
+  ).toEqual([...scripts, runtimeScript]);
+
+  replica.applyDelta({
+    kind: "script_status",
+    update: { workspaceId: descriptor.id, scripts: [] },
+  });
+  expect(replica.snapshot().workspaces.get(descriptor.id)?.scripts).toEqual([]);
+  store.clearSession(serverId);
+});
+
+it("marks an empty script list complete only after the scripts fetch", () => {
+  const serverId = "workspace-empty-script-snapshot";
+  const store = useSessionStore.getState();
+  store.initializeSession(serverId, null);
+  const replica = new WorkspaceDirectoryReplica(serverId);
+  const descriptor = normalizeWorkspaceDescriptor({
+    ...workspace("scripts"),
+    scriptsComplete: false,
+  });
+  replica.acceptWorkspaces([descriptor]);
+  expect(replica.snapshot().workspaces.get(descriptor.id)?.scriptsComplete).toBe(false);
+
+  replica.applyDelta({
+    kind: "script_status",
+    update: { workspaceId: descriptor.id, scripts: [] },
+  });
+  expect(replica.snapshot().workspaces.get(descriptor.id)?.scriptsComplete).toBe(true);
+  store.clearSession(serverId);
+});
+
 it("commits workspace and project-parent state with filtered removals", () => {
   const serverId = "workspace-replica";
   const store = useSessionStore.getState();

@@ -84,6 +84,12 @@ Refcounted git watches feed the store through snapshot-updated events; their lif
 refresh only. Session cleanup and workspace archive retain the data. Removing the final active
 workspace for a directory clears it. The store lives in memory and resets on daemon restart.
 
+For clients advertising `workspace_runtime_scripts`, directory projections include running scripts from memory without reading each
+checkout's `paseo.json`. They mark `scriptsComplete: false`; a workspace screen fetches the
+configured list through `workspace.script.list`. A runtime projection updates running entries
+without discarding configured entries already loaded by the script-status owner. Cache rows
+retain the completeness marker so restoring a runtime-only row cannot claim a full script list.
+
 **Key modules:**
 
 | Module                          | Responsibility                                                                 |

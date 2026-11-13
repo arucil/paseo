@@ -460,6 +460,13 @@ class SessionRequestError extends Error {
   }
 }
 
+function addWorkspaceScriptCompleteness(
+  descriptor: WorkspaceDescriptorPayload,
+  includeConfiguredScripts: boolean,
+): WorkspaceDescriptorPayload {
+  return includeConfiguredScripts ? descriptor : { ...descriptor, scriptsComplete: false };
+}
+
 export interface SessionFileSystem {
   isDirectory(path: string): Promise<boolean>;
 }
@@ -1314,6 +1321,8 @@ export class Session {
       getGlobalServicePorts: () => this.daemonConfigStore.readServicePorts(),
     });
     this.workspaceDirectory = new WorkspaceDirectory({
+      includeConfiguredScripts: () => !this.supports(CLIENT_CAPS.workspaceRuntimeScripts),
+      descriptorReadScope: () => this.delivery.currentSource ?? this,
       logger: this.sessionLogger,
       projectRegistry: this.projectRegistry,
       workspaceRegistry: this.workspaceRegistry,
@@ -6088,6 +6097,7 @@ export class Session {
   private async describeWorkspaceRecord(
     workspace: PersistedWorkspaceRecord,
     projectRecord?: PersistedProjectRecord | null,
+    includeConfiguredScripts = true,
   ): Promise<WorkspaceDescriptorPayload> {
     const resolvedProjectRecord =
       projectRecord ?? (await this.projectRegistry.get(workspace.projectId));
@@ -6103,7 +6113,7 @@ export class Session {
         ? basename(workspace.worktreeRoot)
         : undefined;
 
-    return {
+    const descriptor: WorkspaceDescriptorPayload = {
       id: workspace.workspaceId,
       projectId: workspace.projectId,
       projectDisplayName: resolvedProjectRecord
@@ -6130,13 +6140,18 @@ export class Session {
       activityAt: null,
       createdAt: workspace.createdAt,
       diffStat,
-      scripts: await this.buildWorkspaceScriptPayloadSnapshot(workspace, resolvedProjectRecord),
+      scripts: await this.buildWorkspaceScriptPayloadSnapshot(
+        workspace,
+        resolvedProjectRecord,
+        includeConfiguredScripts,
+      ),
       ...(resolvedProjectRecord
         ? {
             project: await this.buildProjectPlacementForWorkspace(workspace, resolvedProjectRecord),
           }
         : {}),
     };
+    return addWorkspaceScriptCompleteness(descriptor, includeConfiguredScripts);
   }
 
   private buildWorkspaceGitRuntimePayload(
@@ -6170,8 +6185,13 @@ export class Session {
   private async describeWorkspaceRecordWithGitData(
     workspace: PersistedWorkspaceRecord,
     projectRecord?: PersistedProjectRecord | null,
+    includeConfiguredScripts = true,
   ): Promise<WorkspaceDescriptorPayload> {
-    const base = await this.describeWorkspaceRecord(workspace, projectRecord);
+    const base = await this.describeWorkspaceRecord(
+      workspace,
+      projectRecord,
+      includeConfiguredScripts,
+    );
     const snapshot = this.workspaceRuntimeStore.get(workspace.cwd);
     if (!snapshot) {
       return base;
@@ -6249,11 +6269,23 @@ export class Session {
     workspace: PersistedWorkspaceRecord;
     projectRecord?: PersistedProjectRecord | null;
     includeGitData: boolean;
+    includeConfiguredScripts?: boolean;
   }): Promise<WorkspaceDescriptorPayload> {
+    const includeConfiguredScripts =
+      input.includeConfiguredScripts !== false ||
+      !this.supports(CLIENT_CAPS.workspaceRuntimeScripts);
     if (input.includeGitData && input.workspace.kind !== "directory") {
-      return this.describeWorkspaceRecordWithGitData(input.workspace, input.projectRecord);
+      return this.describeWorkspaceRecordWithGitData(
+        input.workspace,
+        input.projectRecord,
+        includeConfiguredScripts,
+      );
     }
-    return this.describeWorkspaceRecord(input.workspace, input.projectRecord);
+    return this.describeWorkspaceRecord(
+      input.workspace,
+      input.projectRecord,
+      includeConfiguredScripts,
+    );
   }
 
   markWorkspaceArchiving(workspaceIds: Iterable<string>, archivingAt: string): void {
@@ -7791,8 +7823,9 @@ export class Session {
   private buildWorkspaceScriptPayloadSnapshot(
     workspace: PersistedWorkspaceRecord,
     project: PersistedProjectRecord | null,
+    includeConfiguredScripts = true,
   ): Promise<WorkspaceDescriptorPayload["scripts"]> {
-    return this.workspaceScripts.buildSnapshot(workspace, project);
+    return this.workspaceScripts.buildSnapshot(workspace, project, { includeConfiguredScripts });
   }
 
   private handleStartWorkspaceScriptRequest(request: StartWorkspaceScriptRequest): Promise<void> {
