@@ -4146,6 +4146,8 @@ export const ServerInfoStatusPayloadSchema = z
         fxProvider: z.boolean().optional(),
         // COMPAT(importSessionWorkspaceTarget): added in v0.1.110, remove gate after 2027-01-16.
         importSessionWorkspaceTarget: z.boolean().optional(),
+        // COMPAT(importSessionSearch): added in v0.8.0, remove gate after 2027-03-02.
+        importSessionSearch: z.boolean().optional(),
         // COMPAT(importSessionMode): added in v0.7.0, remove gate after 2027-03-01.
         importSessionMode: z.boolean().optional(),
         // COMPAT(forgeProviders): added in v0.2.0-beta.1. Drop the gate after
@@ -5577,6 +5579,18 @@ export const DaemonGetStatusResponseSchema = z.object({
           memoryTotalBytes: z.number().positive(),
         })
         .optional(),
+      // Processes a terminal cleanup on this host could not confirm gone.
+      terminalCleanupUnconfirmed: z
+        .array(
+          z.object({
+            pid: z.number(),
+            role: z.string(),
+            reason: z.string(),
+            detail: z.string(),
+          }),
+        )
+        .optional(),
+      terminalsUnavailable: z.string().optional(),
     })
     .passthrough(),
 });

@@ -1,4 +1,4 @@
-import { execCommand } from "../../packages/server/src/utils/spawn.js";
+import { execCommand } from "@getpaseo/server/process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";

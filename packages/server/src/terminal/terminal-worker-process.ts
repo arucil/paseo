@@ -68,12 +68,10 @@ function readArg(argv: string[], name: string): string {
 
 function parseWorkerArgs(argv: string[], recordIdArg: string): WorkerArgs {
   return {
-    id: session.id,
-    name: session.name,
-    cwd: session.cwd,
-    ...(session.workspaceId !== undefined ? { workspaceId: session.workspaceId } : {}),
-    ...(session.getTitle() ? { title: session.getTitle() } : {}),
-    activity: session.getActivity(),
+    recordId: readArg(argv, recordIdArg),
+    paseoHome: readArg(argv, "--paseo-home"),
+    paseoVersion: readArg(argv, "--paseo-version"),
+    runtime: argv.includes("--runtime") ? readArg(argv, "--runtime") : null,
   };
 }
 
@@ -358,136 +356,12 @@ function runWorker(argv: string[]): void {
         replayPreamble: session.getReplayPreamble(),
       });
     });
-  });
-  const unsubscribeTitle = session.onTitleChange((title) => {
-    outputCoalescer.flush();
-    sendToParent({
-      type: "terminalTitleChange",
-      terminalId: session.id,
-      title,
-    });
-  });
-  const unsubscribeCommandFinished = session.onCommandFinished((info) => {
-    outputCoalescer.flush();
-    sendToParent({
-      type: "terminalCommandFinished",
-      terminalId: session.id,
-      info,
-    });
-  });
-  const unsubscribeActivity = session.onActivityChange((transition) => {
-    sendToParent({
-      type: "terminalActivityChange",
-      terminalId: session.id,
-      activity: transition.activity,
-      previous: transition.previous,
-    });
-  });
-
-  unsubscribeByTerminalId.set(session.id, [
-    unsubscribeMessage,
-    unsubscribeExit,
-    unsubscribeTitle,
-    unsubscribeCommandFinished,
-    unsubscribeActivity,
-  ]);
-}
-
-function enqueueCreateTerminalRequest(message: TerminalCreateRequest): Promise<void> {
-  const nextRequest = createTerminalQueue.then(() => handleCreateTerminalRequest(message));
-  createTerminalQueue = nextRequest.catch(() => {});
-  return nextRequest;
-}
-
-async function handleCreateTerminalRequest(message: TerminalCreateRequest): Promise<void> {
-  const request: InFlightTerminalCreateRequest = {
-    requestId: message.requestId,
-    errorReported: false,
-  };
-  inFlightTerminalCreateRequest = request;
-  try {
-    const session = await manager.createTerminal(message.options);
-    if (request.errorReported) {
-      session.kill();
-      return;
-    }
-    watchTerminal(session);
-    const initialSnapshot = session.getStateSnapshot();
-    sendToParent({
-      type: "terminalCreated",
-      terminal: toTerminalInfo(session),
-      state: initialSnapshot.state,
-    });
-    sendToParent({
-      type: "response",
-      requestId: message.requestId,
-      ok: true,
-      result: {
-        terminal: toTerminalInfo(session),
-        state: initialSnapshot.state,
-      },
-    });
-  } catch (error) {
-    reportInFlightTerminalCreateFailure(error);
-  } finally {
-    if (inFlightTerminalCreateRequest === request) {
-      inFlightTerminalCreateRequest = null;
-    }
-  }
-}
-
-async function handleRequest(message: TerminalWorkerRequest): Promise<void> {
-  switch (message.type) {
-    case "createTerminal": {
-      await enqueueCreateTerminalRequest(message);
-      return;
-    }
-
-    case "registerCwdEnv": {
-      manager.registerCwdEnv({ cwd: message.cwd, env: message.env });
-      sendToParent({ type: "response", requestId: message.requestId, ok: true });
-      return;
-    }
-
-    case "setActivity": {
-      await manager.setTerminalActivity(message.terminalId, message.state);
-      sendToParent({ type: "response", requestId: message.requestId, ok: true });
-      return;
-    }
-
-    case "clearAttention": {
-      await manager.clearTerminalAttention(message.terminalId);
-      sendToParent({ type: "response", requestId: message.requestId, ok: true });
-      return;
-    }
-
-    case "killTerminal": {
-      manager.killTerminal(message.terminalId);
-      // Removal is owned by session.onExit -> terminalExit; the parent mirror
-      // clears contribution and emits terminalsChanged from that single path.
-      clearTerminalSubscriptions(message.terminalId);
-      sendToParent({ type: "response", requestId: message.requestId, ok: true });
-      return;
-    }
-
-    case "killTerminalAndWait": {
-      await manager.killTerminalAndWait(message.terminalId, message.options);
-      clearTerminalSubscriptions(message.terminalId);
-      sendToParent({ type: "response", requestId: message.requestId, ok: true });
-      return;
-    }
-
-    case "getTerminalState": {
-      // Flush buffered output before snapshotting: the headless state already includes it,
-      // so if the coalescer emitted it afterward (in a batch carrying a revision past the
-      // snapshot's) the controller's revision dedup wouldn't drop it and the client would
-      // see the bytes twice. Flushing first sends them with a revision <= the snapshot's.
-      outputCoalescerByTerminalId.get(message.terminalId)?.flush();
-      sendToParent({
-        type: "response",
-        requestId: message.requestId,
-        ok: true,
-        result: buildTerminalStateResult(manager.getTerminal(message.terminalId), message.options),
+    const unsubscribeExit = session.onExit((info) => {
+      outputCoalescer.flush();
+      clearTerminalSubscriptions(session.id);
+      sessionsById.delete(session.id);
+      void persistRecord().catch((error) => {
+        if (!exiting) console.error("Cannot publish terminal exit:", error);
       });
       if (exitsHeldDuringCreation.has(session.id)) {
         exitsHeldDuringCreation.set(session.id, info);
@@ -583,11 +457,7 @@ async function handleRequest(message: TerminalWorkerRequest): Promise<void> {
     };
     inFlightTerminalCreateRequest = request;
     try {
-      const { workspaceId } = message.options;
-      if (!workspaceId) {
-        throw new Error("workspaceId is required");
-      }
-      const session = await manager.createTerminal({ ...message.options, workspaceId });
+      const session = await manager.createTerminal(message.options);
       if (request.errorReported) {
         session.kill();
         return;

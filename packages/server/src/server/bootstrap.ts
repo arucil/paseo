@@ -1903,7 +1903,16 @@ export async function createPaseoDaemon(
               orchestrationSkills,
               workspaceLabelService,
             );
-            await startWebSocketRuntime({ server: wsServer, pluginRuntime });
+            await startWebSocketRuntime({
+              server: wsServer,
+              pluginRuntime,
+              beforeAcceptingConnections: async () => {
+                providerSnapshotManager.settlePluginProviders();
+                restartRecovery.resumePending();
+                await finishSubscriptions.start();
+              },
+            });
+            const relaySecurityLogger = logger.child({ module: "relay-security" });
             relayRuntime = createRelayRuntime({
               config: {
                 enabled: relayEnabled,
@@ -1992,6 +2001,8 @@ export async function createPaseoDaemon(
     await idleRuntimeCleanup.close();
     // Freeze both ingress and registration before taking the agent closure snapshot.
     await wsServer?.prepareForShutdown();
+    await finishSubscriptions.close();
+    await wsServer?.agentMessages.close();
     agentManager.prepareForShutdown();
     await restartRecovery.captureRunningAgents();
     await closeAllAgents(logger, agentManager);

@@ -813,7 +813,8 @@ export async function createTerminal(
     env: {
       ...env,
       ...activityEnv,
-      PASEO_WORKSPACE_ID: workspaceId,
+      ...(workspaceId !== undefined ? { PASEO_WORKSPACE_ID: workspaceId } : {}),
+      ...(process.platform === "win32" ? {} : { PWD: cwd }),
     },
     ...resolveTerminalEnvironmentSource({ baseEnv, paseoCliPath }),
   });
@@ -825,15 +826,7 @@ export async function createTerminal(
     cols,
     rows,
     cwd,
-    env: buildTerminalEnvironment({
-      shell: spawnCommand,
-      env: {
-        ...env,
-        ...activityEnv,
-        ...(workspaceId ? { PASEO_WORKSPACE_ID: workspaceId } : {}),
-        ...(process.platform === "win32" ? {} : { PWD: cwd }),
-      },
-    }),
+    env: terminalEnv,
   });
 
   function emitTitleChange(nextTitle: string | undefined): void {

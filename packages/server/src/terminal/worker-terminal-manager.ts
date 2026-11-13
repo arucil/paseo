@@ -75,7 +75,7 @@ interface PendingRequest {
 
 interface WorkerTerminalRecord {
   info: WorkerTerminalInfo;
-  state: TerminalState;
+  state: WorkerTerminalState;
   activity: TerminalActivity | null;
   // Cached input-mode preamble from the worker (the authoritative tracker lives
   // in the worker process). Updated with streamed output and snapshot responses.
@@ -139,7 +139,7 @@ function cloneTerminalInfo(info: WorkerTerminalInfo): WorkerTerminalInfo {
     id: info.id,
     name: info.name,
     cwd: info.cwd,
-    ...(info.workspaceId !== undefined ? { workspaceId: info.workspaceId } : {}),
+    workspaceId: info.workspaceId,
     ...(info.title ? { title: info.title } : {}),
     activity: info.activity,
   };
@@ -158,8 +158,6 @@ export function createWorkerTerminalManager(
   const pendingRequests = new Map<string, PendingRequest>();
   const inFlight = new Set<Promise<void>>();
   const recordsById = new Map<string, WorkerTerminalRecord>();
-  const creatingTerminalIds = new Set<string>();
-  const earlyExitedCreateSessionsById = new Map<string, TerminalSession>();
   const terminalIdsByCwd = new Map<string, Set<string>>();
   const terminalActivityTokenById = new Map<string, string>();
   // Creation owns a reference to the session independently of the live-terminal
@@ -219,7 +217,7 @@ export function createWorkerTerminalManager(
         id: record.info.id,
         name: record.info.name,
         cwd: record.info.cwd,
-        ...(record.info.workspaceId !== undefined ? { workspaceId: record.info.workspaceId } : {}),
+        workspaceId: record.info.workspaceId,
         ...(record.info.title ? { title: record.info.title } : {}),
         activity: record.activity,
       });
@@ -229,7 +227,7 @@ export function createWorkerTerminalManager(
 
   function registerRecord(input: {
     info: WorkerTerminalInfo;
-    state: TerminalState;
+    state: WorkerTerminalState;
   }): TerminalSession {
     const existing = recordsById.get(input.info.id);
     if (existing) {
@@ -435,14 +433,6 @@ export function createWorkerTerminalManager(
       listener(message.info);
     }
     record.exitListeners.clear();
-    // A short-lived command can exit after the worker sends its create response
-    // but before the awaiting createTerminal continuation runs in this process.
-    // Preserve that already-exited session until the creator receives it; otherwise
-    // createTerminal would recreate a live-looking mirror record from stale response
-    // data and permanently lose the exit event.
-    if (creatingTerminalIds.has(message.terminalId)) {
-      earlyExitedCreateSessionsById.set(message.terminalId, record.session);
-    }
     const previousBucket = deriveTerminalActivityStatusBucket(record.activity);
     const removedRecord = removeRecord(message.terminalId);
     if (previousBucket !== null && removedRecord?.info.workspaceId !== undefined) {
@@ -541,7 +531,7 @@ export function createWorkerTerminalManager(
   function handleWorkerEvent(message: TerminalWorkerToParentMessage): void {
     switch (message.type) {
       case "terminalCreated": {
-        registerRecord({
+        const session = registerRecord({
           info: message.terminal,
           state: message.state,
         });
@@ -767,7 +757,7 @@ export function createWorkerTerminalManager(
         });
     }
     for (const item of listed) {
-      const info = asRequiredWorkerTerminalInfo(item.terminal);
+      const info = item.terminal;
       registerRecord({ info, state: item.state });
       const record = recordsById.get(info.id);
       if (record) {
@@ -823,11 +813,8 @@ export function createWorkerTerminalManager(
       const activityToken = createActivityToken();
       const terminalActivityUrl = managerOptions.getTerminalActivityUrl?.() ?? null;
       terminalActivityTokenById.set(terminalId, activityToken);
-      creatingTerminalIds.add(terminalId);
-      let result: {
-        terminal: WorkerTerminalInfo;
-        state: TerminalState;
-      };
+      const creation = { session: null as TerminalSession | null };
+      pendingCreationsById.set(terminalId, creation);
       try {
         const environment = resolveCreateEnvironment();
         await sendRequest({
@@ -840,33 +827,17 @@ export function createWorkerTerminalManager(
             baseEnv: environment.baseEnv,
             paseoCliPath: environment.paseoCliPath,
           },
-        })) as {
-          terminal: WorkerTerminalInfo;
-          state: TerminalState;
-        };
+        });
+        if (!creation.session) {
+          throw new Error("Terminal worker completed creation without a terminalCreated event");
+        }
+        return creation.session;
       } catch (error) {
         terminalActivityTokenById.delete(terminalId);
-        earlyExitedCreateSessionsById.delete(terminalId);
         throw error;
       } finally {
-        creatingTerminalIds.delete(terminalId);
+        pendingCreationsById.delete(terminalId);
       }
-      if (result.terminal.id !== terminalId) {
-        terminalActivityTokenById.delete(terminalId);
-        earlyExitedCreateSessionsById.delete(terminalId);
-        throw new Error(
-          `Terminal worker returned mismatched create id: expected ${terminalId}, received ${result.terminal.id}`,
-        );
-      }
-      const session =
-        recordsById.get(terminalId)?.session ?? earlyExitedCreateSessionsById.get(terminalId);
-      earlyExitedCreateSessionsById.delete(terminalId);
-      if (!session) {
-        throw new Error(
-          `Terminal worker omitted lifecycle state for created terminal ${terminalId}`,
-        );
-      }
-      return session;
     },
 
     registerCwdEnv(options: { cwd: string; env: Record<string, string> }): void {

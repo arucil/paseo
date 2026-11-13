@@ -102,7 +102,7 @@ export interface TerminalSessionControllerOptions {
   // stream.
   // Bytes queued on the client transport but not yet sent, or null when the
   // transport exposes no backpressure signal (e.g. the multiplexed relay socket).
-  getClientBufferedAmount?: () => number | null;
+  getClientBufferedAmount?: (source: object) => number | null;
   utilityTerminalService?: UtilityTerminalService | null;
 }
 
@@ -159,15 +159,12 @@ export class TerminalSessionController {
   private readonly sessionLogger: pino.Logger;
   private readonly listTerminalWorkspaceRefs: () => Promise<readonly TerminalWorkspaceRef[]>;
   private readonly listTerminalWorkspaceRoots: () => Promise<readonly string[]>;
-  private readonly clientSupportsWrapReflow: () => boolean;
-  private readonly getClientBufferedAmount: () => number | null;
+  private readonly getClientBufferedAmount: (source: object) => number | null;
   private readonly utilityTerminalService: UtilityTerminalService | null;
-  private readonly terminalSizeOwner = {};
 
   private readonly subscribedDirectories = new Map<string, TerminalDirectorySubscription>();
   private unsubscribeTerminalsChanged: (() => void) | null = null;
   private unsubscribeUtilityTerminalsChanged: (() => void) | null = null;
-  private readonly exitSubscriptions = new Map<string, () => void>();
   private readonly activeStreams = new Map<number, ActiveTerminalStream>();
   private nextSlot = 0;
 
@@ -349,53 +346,7 @@ export class TerminalSessionController {
     }
   }
 
-  private ensureExitSubscription(terminal: TerminalSession): void {
-    if (this.exitSubscriptions.has(terminal.id)) {
-      return;
-    }
-    const unsubscribeExit = terminal.onExit(() => {
-      this.handleTerminalExited(terminal.id);
-    });
-    this.exitSubscriptions.set(terminal.id, unsubscribeExit);
-  }
-
-  private handleTerminalExited(terminalId: string): void {
-    const unsubscribeExit = this.exitSubscriptions.get(terminalId);
-    if (unsubscribeExit) {
-      unsubscribeExit();
-      this.exitSubscriptions.delete(terminalId);
-    }
-    this.detachStream(terminalId, { emitExit: true });
-  }
-
-  private emitTerminalsChangedSnapshot(input: {
-    cwd: string;
-    terminals: Array<{
-      id: string;
-      name: string;
-      workspaceId?: string;
-      title?: string;
-      activity: TerminalActivity | null;
-    }>;
-  }): void {
-    this.emit({
-      type: "terminals_changed",
-      payload: {
-        cwd: input.cwd,
-        terminals: input.terminals,
-      },
-    });
-  }
-
-  private toTerminalInfo(
-    terminal: Pick<TerminalSession, "id" | "name" | "workspaceId" | "getTitle" | "getActivity">,
-  ): {
-    id: string;
-    name: string;
-    workspaceId?: string;
-    title?: string;
-    activity: TerminalActivity | null;
-  } {
+  private toTerminalInfo(terminal: TerminalSession) {
     const title = terminal.getTitle();
     const activity = terminal.getActivity();
     return {
@@ -560,6 +511,25 @@ export class TerminalSessionController {
         },
       });
     }
+  }
+
+  private emitIncompatible(
+    msg: { type: string; requestId?: string },
+    error: TerminalWorkerIncompatibleError,
+  ): void {
+    if (msg.requestId === undefined) {
+      this.emit({ type: "status", payload: { status: "error", message: error.message } });
+      return;
+    }
+    this.emit({
+      type: "rpc_error",
+      payload: {
+        requestId: msg.requestId,
+        requestType: msg.type,
+        error: error.message,
+        code: error.code,
+      },
+    });
   }
 
   private ensureUtilityTerminalSubscription(): void {

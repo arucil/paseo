@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useState, type ReactElement } from "re
 import { useIsFocused } from "@react-navigation/native";
 import { useTranslation } from "react-i18next";
 import {
-  Pressable,
   ScrollView,
   Text,
   View,
@@ -28,7 +27,7 @@ import {
 } from "lucide-react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { router } from "expo-router";
-import { SidebarMenuToggle } from "@/components/headers/menu-header";
+import { SidebarMenuToggle } from "@/components/headers/sidebar-menu-toggle";
 import { ScreenHeader } from "@/components/headers/screen-header";
 import { ScreenTitle } from "@/components/headers/screen-title";
 import { DiffStat } from "@/components/diff-stat";
@@ -37,6 +36,7 @@ import { AdaptiveTextInput } from "@/components/adaptive-text-input";
 import { StatusRing } from "@/components/status-ring";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import { Button } from "@/components/ui/button";
+import { PressHighlight } from "@/components/ui/press-highlight";
 import { ToolbarButton, ToolbarControls } from "@/components/ui/pane-content-toolbar";
 import { SidebarModelProvider, useSidebarModel } from "@/components/sidebar/sidebar-model";
 import { resolveSidebarWorkspacePrimaryLabel } from "@/components/sidebar/sidebar-workspace-title";
@@ -761,7 +761,7 @@ function CockpitWorkspaceCard({
       style={rootStyle}
       testID={`cockpit-workspace-card-${workspace.workspaceKey}`}
     >
-      <Pressable
+      <PressHighlight
         accessibilityRole="button"
         accessibilityLabel={accessibilityLabel}
         onFocus={handleFocus}
@@ -804,14 +804,14 @@ function CockpitWorkspaceCard({
                   deletions={workspace.diffStat.deletions}
                 />
               ) : null}
-              {agentUsage ? (
+              {agentUsage && workspace.agentId ? (
                 <ContextWindowMeter
                   maxTokens={agentUsage.contextWindowMaxTokens}
                   usedTokens={agentUsage.contextWindowUsedTokens}
                   totalCostUsd={agentUsage.totalCostUsd}
                   showPercentage
                   serverId={workspace.serverId}
-                  provider={agentUsage.provider}
+                  agentId={workspace.agentId}
                 />
               ) : null}
             </View>
@@ -854,7 +854,7 @@ function CockpitWorkspaceCard({
         </View>
 
         <CockpitCardActivity workspace={workspace} />
-      </Pressable>
+      </PressHighlight>
       {!isSnoozed && showQuickReply && workspace.agentId ? (
         <CockpitQuickReply
           agentId={workspace.agentId}
@@ -893,7 +893,7 @@ function CockpitWorkspaceNoteButton({
   testID: string;
 }) {
   return (
-    <Pressable
+    <PressHighlight
       accessibilityRole="button"
       accessibilityLabel={label}
       accessibilityHint={accessibilityHint}
@@ -903,7 +903,7 @@ function CockpitWorkspaceNoteButton({
       testID={testID}
     >
       <ThemedPencil size={12} />
-    </Pressable>
+    </PressHighlight>
   );
 }
 
@@ -1029,10 +1029,10 @@ function CockpitQuickReply({
       return;
     }
 
+    const turn = useSessionStore.getState().sessions[serverId]?.agents.get(agentId)?.turn;
     const activeTurnId =
-      quickReplyAction.activeTurnBehavior === "steer"
-        ? (useSessionStore.getState().sessions[serverId]?.agents.get(agentId)?.activeTurn?.turnId ??
-          undefined)
+      quickReplyAction.activeTurnBehavior === "steer" && turn?.phase === "open"
+        ? (turn.turnId ?? undefined)
         : undefined;
     setIsSubmitting(true);
     try {
@@ -1103,7 +1103,7 @@ function CockpitQuickReply({
           style={styles.quickReplyInput}
           testID={`cockpit-quick-reply-input-${agentId}`}
         />
-        <Pressable
+        <PressHighlight
           accessibilityLabel={t("composer.input.sendMessage")}
           accessibilityRole="button"
           accessibilityState={sendAccessibilityState}
@@ -1117,7 +1117,7 @@ function CockpitQuickReply({
           ) : (
             <ThemedArrowUp size={15} />
           )}
-        </Pressable>
+        </PressHighlight>
       </View>
       {error ? (
         <Text style={styles.quickReplyError} numberOfLines={1}>

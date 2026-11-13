@@ -24,8 +24,41 @@ describe("startWebSocketRuntime", () => {
           events.push("start-plugins");
         },
       },
+      beforeAcceptingConnections: async () => {
+        events.push("settle-providers-and-recovery");
+      },
     });
 
-    expect(events).toEqual(["bind-plugins", "start-plugins", "accepting", "restore-utilities"]);
+    expect(events).toEqual([
+      "bind-plugins",
+      "start-plugins",
+      "settle-providers-and-recovery",
+      "accepting",
+      "restore-utilities",
+    ]);
+  });
+
+  test("keeps ingress paused when startup preparation fails", async () => {
+    const events: string[] = [];
+    await expect(
+      startWebSocketRuntime({
+        server: {
+          beginAcceptingConnections() {
+            events.push("accepting");
+          },
+          async restoreUtilityTerminals() {
+            events.push("restore-utilities");
+          },
+        },
+        pluginRuntime: {
+          bindPaseoSessionHost() {},
+          async start() {},
+        },
+        beforeAcceptingConnections: async () => {
+          throw new Error("recovery unavailable");
+        },
+      }),
+    ).rejects.toThrow("recovery unavailable");
+    expect(events).toEqual([]);
   });
 });

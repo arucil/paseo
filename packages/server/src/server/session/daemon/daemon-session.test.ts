@@ -224,6 +224,7 @@ describe("DaemonSession", () => {
             { provider: "codex", available: false, error: "boom" },
           ],
           systemUsage: SYSTEM_USAGE,
+          terminalCleanupUnconfirmed: [],
         },
       },
     ]);
@@ -255,6 +256,7 @@ describe("DaemonSession", () => {
           relay: null,
           providers: [],
           systemUsage: SYSTEM_USAGE,
+          terminalCleanupUnconfirmed: [],
         },
       },
     ]);

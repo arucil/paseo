@@ -1,8 +1,6 @@
-import { execFile, spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
-import { extname } from "node:path";
-import { promisify } from "node:util";
+import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { fileURLToPath } from "node:url";
-
+import { spawnProcess as spawnCli, execCommand as execCli } from "@getpaseo/plugin/server";
 import { createExternalCommandProcessEnv, type ProcessEnvRecord } from "../server/paseo-env.js";
 
 interface ExternalEnvOptions {
@@ -29,27 +27,8 @@ interface ExecCommandResult {
   stderr: string;
 }
 
-function hasPathSeparator(value: string): boolean {
-  return value.includes("/") || value.includes("\\");
-}
-
-function shouldUseWindowsShell(
-  command: string,
-  requestedShell?: boolean | string,
-): boolean | string {
-  if (isWindowsCommandScript(command)) {
-    return true;
-  }
-  if (requestedShell !== undefined) {
-    return requestedShell;
-  }
-  return process.platform === "win32" && !hasPathSeparator(command) && !extname(command);
-}
-
 function createWorkingDirectoryEnv(cwd: SpawnOptions["cwd"]): ProcessEnvRecord {
-  if (process.platform === "win32" || cwd === undefined) {
-    return {};
-  }
+  if (process.platform === "win32" || cwd === undefined) return {};
   return { PWD: typeof cwd === "string" ? cwd : fileURLToPath(cwd) };
 }
 
@@ -60,12 +39,6 @@ export function spawnProcess(
 ): ChildProcess {
   const { baseEnv, env, envOverlay, ...spawnOptions } = options ?? {};
   const resolvedBaseEnv = env ?? baseEnv ?? process.env;
-  const isWindows = process.platform === "win32";
-  const shell = shouldUseWindowsShell(command, spawnOptions.shell);
-
-  const shouldQuoteForShell = isWindows && shell !== false;
-  const resolvedCommand = shouldQuoteForShell ? quoteWindowsCommand(command) : command;
-  const resolvedArgs = shouldQuoteForShell ? args.map(quoteWindowsArgument) : args;
   const workingDirectoryEnv = createWorkingDirectoryEnv(spawnOptions.cwd);
   const childEnv =
     options?.envMode === "internal"
@@ -91,11 +64,6 @@ export async function execCommand(
 ): Promise<ExecCommandResult> {
   const { baseEnv, env, envOverlay } = options ?? {};
   const resolvedBaseEnv = env ?? baseEnv ?? process.env;
-  const isWindows = process.platform === "win32";
-  const shell = shouldUseWindowsShell(command, options?.shell);
-  const shouldQuoteForShell = isWindows && shell !== false;
-  const resolvedCommand = shouldQuoteForShell ? quoteWindowsCommand(command) : command;
-  const resolvedArgs = shouldQuoteForShell ? args.map(quoteWindowsArgument) : args;
   const workingDirectoryEnv = createWorkingDirectoryEnv(options?.cwd);
   const childEnv =
     options?.envMode === "internal"

@@ -77,6 +77,15 @@ import { WorkspaceArchiveOperations } from "./workspace-archive-operations.js";
 import type { HubExecutionAgents } from "./hub/daemon-executions.js";
 import type { AgentProvider } from "./agent/agent-sdk-types.js";
 import { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
+
+function requireProviderSnapshotManager(
+  manager: ProviderSnapshotManager | undefined,
+): ProviderSnapshotManager {
+  if (!manager) {
+    throw new Error("providerSnapshotManager is required");
+  }
+  return manager;
+}
 import { attachMutableProviderConfigOwner } from "./agent/mutable-provider-config-owner.js";
 import type {
   WorkspaceGitRuntimeSnapshot,
@@ -789,7 +798,7 @@ export class VoiceAssistantWebSocketServer {
     this.passwordHash = auth?.password;
     this.daemonConfigStore = daemonConfigStore;
     this.mcpBaseUrl = mcpBaseUrl;
-    this.assignOptionalServices({
+    this.utilityTerminalService = this.assignOptionalServices({
       speech,
       terminalManager,
       dictation,
@@ -802,17 +811,7 @@ export class VoiceAssistantWebSocketServer {
       serviceProxyPublicBaseUrl,
       resolveScriptHealth,
     });
-    this.utilityTerminalService = this.terminalManager
-      ? createUtilityTerminalService({
-          paseoHome,
-          terminalManager: this.terminalManager,
-          logger: this.logger,
-        })
-      : null;
-    if (!providerSnapshotManager) {
-      throw new Error("providerSnapshotManager is required");
-    }
-    this.providerSnapshotManager = providerSnapshotManager;
+    this.providerSnapshotManager = requireProviderSnapshotManager(providerSnapshotManager);
     this.serverCapabilities = buildServerCapabilities({
       readiness: this.speech?.getReadiness() ?? null,
     });
@@ -867,7 +866,7 @@ export class VoiceAssistantWebSocketServer {
     getDaemonTcpHost: (() => string | null) | undefined;
     serviceProxyPublicBaseUrl: string | null | undefined;
     resolveScriptHealth: ((hostname: string) => ScriptHealthState | null) | undefined;
-  }): void {
+  }): UtilityTerminalService | null {
     this.speech = params.speech ?? null;
     this.terminalManager = params.terminalManager ?? null;
     if (this.terminalManager) {
@@ -903,6 +902,13 @@ export class VoiceAssistantWebSocketServer {
     this.getDaemonTcpHost = params.getDaemonTcpHost ?? null;
     this.serviceProxyPublicBaseUrl = params.serviceProxyPublicBaseUrl ?? null;
     this.resolveScriptHealth = params.resolveScriptHealth ?? null;
+    return this.terminalManager
+      ? createUtilityTerminalService({
+          paseoHome: this.paseoHome,
+          terminalManager: this.terminalManager,
+          logger: this.logger,
+        })
+      : null;
   }
 
   private createWebSocketServer(
@@ -2209,6 +2215,8 @@ export class VoiceAssistantWebSocketServer {
         fxProvider: this.providerSnapshotManager.supportsConfigRequiredProvider("fx"),
         // COMPAT(importSessionWorkspaceTarget): added in v0.1.110, remove gate after 2027-01-16.
         importSessionWorkspaceTarget: true,
+        // COMPAT(importSessionSearch): added in v0.8.0, remove gate after 2027-03-02.
+        importSessionSearch: true,
         // COMPAT(importSessionMode): added in v0.7.0, remove gate after 2027-03-01.
         importSessionMode: true,
         // COMPAT(forgeProviders): added in v0.2.0-beta.1. Drop the gate after

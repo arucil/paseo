@@ -27,6 +27,25 @@ export function resolveDesktopSidebarVisibility(input: {
 
 export type DesktopSidebarPresentation = "hidden" | "rail" | "expanded";
 
+export function resolveLeftSidebarPresentation(input: {
+  chromeEnabled: boolean;
+  isCompactLayout: boolean;
+  isFocusModeEnabled: boolean;
+  desktopSidebarVisible: boolean;
+}): LeftSidebarPresentation {
+  if (!input.chromeEnabled) return "hidden";
+  if (input.isCompactLayout) return "overlay";
+  if (input.isFocusModeEnabled) return "hidden";
+  return input.desktopSidebarVisible ? "dock" : "overlay";
+}
+
+export function resolveDesktopSidebarInsetLeft(input: {
+  overlay: boolean;
+  safeAreaLeft: number;
+}): number {
+  return input.overlay ? input.safeAreaLeft : 0;
+}
+
 export function resolveDesktopSidebarPresentation(input: {
   chromeEnabled: boolean;
   isCompactLayout: boolean;

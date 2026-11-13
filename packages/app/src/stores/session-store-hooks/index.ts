@@ -17,9 +17,7 @@ import {
   selectWorkspaceExists,
   selectWorkspaceFields,
   selectWorkspaceKeys,
-  selectWorkspaceOrderByScope,
   selectWorkspaceScriptEntries,
-  selectWorkspaceStatusesForBadges,
   workspaceEqualityFns,
   type WorkspaceScriptEntry,
   type WorkspaceStructure,
@@ -31,7 +29,6 @@ import { useSessionStore, type WorkspaceDescriptor } from "../session-store";
 // or the sessions dict — it breaks re-render isolation.
 
 export type {
-  DesktopBadgeWorkspaceStatus,
   WorkspaceScriptEntry,
   WorkspaceStructure,
   WorkspaceStructureProject,

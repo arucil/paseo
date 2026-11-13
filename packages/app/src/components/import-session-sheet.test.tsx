@@ -183,16 +183,6 @@ const mockSnapshot = vi.hoisted(() => ({
   },
 }));
 
-const mockHostFeatures = vi.hoisted(() => ({
-  importSessionWorkspaceTarget: false,
-  importSessionMode: false,
-}));
-
-vi.mock("@/runtime/host-features", () => ({
-  useHostFeature: (_serverId: string, feature: keyof typeof mockHostFeatures) =>
-    mockHostFeatures[feature],
-}));
-
 vi.mock("@/hooks/use-providers-snapshot", () => ({
   useProvidersSnapshot: () => ({
     entries: mockSnapshot.current.entries,
@@ -251,8 +241,19 @@ function applyHostMocks(options?: RenderOptions) {
     entries: options?.snapshot?.entries,
     supportsSnapshot: options?.snapshot?.supportsSnapshot ?? false,
   };
-  mockHostFeatures.importSessionMode = options?.supportsImportMode ?? false;
-  mockHostFeatures.importSessionWorkspaceTarget = false;
+  mockHostFeatures.current = {
+    importSessionSearch: options?.supportsSearch ?? true,
+    importSessionWorkspaceTarget: true,
+    importSessionMode: options?.supportsImportMode ?? false,
+  };
+  mockHostProjects.current = options?.projects ?? [];
+}
+
+function renderSheet(
+  client: Pick<DaemonClient, "fetchRecentProviderSessions" | "importAgent">,
+  options?: RenderOptions,
+) {
+  applyHostMocks(options);
 
   const queryClient = new QueryClient({
     defaultOptions: {

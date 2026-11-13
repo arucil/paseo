@@ -25,7 +25,6 @@ import {
   useCallback,
   useContext,
   useEffect,
-  useLayoutEffect,
   useMemo,
   useState,
   useSyncExternalStore,
@@ -51,7 +50,7 @@ import { AppDiagnosticHost } from "@/components/app-diagnostic-host";
 import { AppearanceStyleBoundary } from "@/components/appearance-style-boundary";
 import { LeftSidebar } from "@/components/left-sidebar";
 import { SidebarActivityBar } from "@/components/sidebar/sidebar-activity-bar";
-import { WindowSidebarMenuToggle } from "@/components/headers/menu-header";
+import { WindowSidebarMenuToggle } from "@/components/headers/sidebar-menu-toggle";
 import { DesktopWindowControls } from "@/components/desktop/window-controls";
 import { SidebarModelProvider } from "@/components/sidebar/sidebar-model";
 import { WorkspacePinShortcutHandler } from "@/components/workspace-pin-shortcut-handler";
@@ -127,7 +126,7 @@ import {
   useHosts,
 } from "@/runtime/host-runtime";
 import { getDaemonStartService } from "@/runtime/daemon-start-service";
-import { usePanelStore, type LeftSidebarPresentation } from "@/stores/panel-store";
+import { usePanelStore } from "@/stores/panel-store";
 import { flushDraftPersistStorage } from "@/stores/draft-store";
 import { getNextThemePreference, ICON_STROKE_WIDTH } from "@/styles/theme";
 import { useSessionStore } from "@/stores/session-store";
@@ -488,6 +487,12 @@ function AppContainer({ children, chromeEnabled: chromeEnabledOverride }: AppCon
     }),
   });
   const hasTopLeftWindowControls = useHasWindowChromeObstruction("top-left");
+  const sidebarPresentation = resolveLeftSidebarPresentation({
+    chromeEnabled,
+    isCompactLayout,
+    isFocusModeEnabled: isWorkspaceFocusModeEnabled,
+    desktopSidebarVisible,
+  });
   const appChromeLayout = resolveDesktopAppChromeLayout({
     desktopSidebarRendered: desktopSidebarVisible,
     hasTopLeftWindowControls,
@@ -497,6 +502,7 @@ function AppContainer({ children, chromeEnabled: chromeEnabledOverride }: AppCon
     <SidebarChrome
       mounted={isCompactLayout ? chromeEnabled : desktopSidebarMounted}
       visible={isCompactLayout ? chromeEnabled : desktopSidebarVisible}
+      overlay={sidebarPresentation === "overlay"}
       showActivityBar={desktopSidebarPresentation === "rail"}
       keyboardShortcutsEnabled={keyboardShortcutsEnabled}
     />
@@ -533,41 +539,50 @@ function AppContainer({ children, chromeEnabled: chromeEnabledOverride }: AppCon
   const surface = (
     <View style={layoutStyles.surfaceFill}>
       {workspaceChrome}
-      {!isCompactLayout && appChromeLayout.sidebarToggleOwner === "window" ? (
-        <WindowChromeRegion corners="top-left">
-          <WindowChromeSafeArea
-            placement="inline"
-            horizontalPadding={WINDOW_SIDEBAR_TOGGLE_HORIZONTAL_PADDING}
-            pointerEvents="box-none"
-            style={layoutStyles.windowSidebarToggle}
-          >
-            <WindowSidebarMenuToggle />
-          </WindowChromeSafeArea>
-        </WindowChromeRegion>
-      ) : null}
-      <UtilityTrayTriggerHost />
-      <DesktopWindowControls />
-      <FloatingPanelPortalHost />
-      <UtilityTrayHost />
-      {isCompactLayout ? sidebarChrome : null}
-      <DownloadToast />
-      <RosettaCalloutSource />
-      <UpdateCalloutSource />
-      <LegacyAgentSkillsMigration />
-      <WorktreeSetupCalloutSource />
-      <CommandCenterRootActions />
-      <CommandCenterWorkspaceActions />
-      <PluginCommandCenterActions />
-      <WorkspacePinShortcutHandler />
-      <WorkspaceRenameHost />
-      <CommandCenter />
-      <AddProjectFlowHost />
-      <HostChooserModal />
-      <ProviderSettingsHost />
-      <WorkspaceSetupDialog />
-      <KeyboardShortcutsDialog />
-      <AppDiagnosticHost />
-      <QuittingOverlay />
+      <AddHostFlowHost />
+      <AppearanceStyleBoundary>
+        {!isCompactLayout && appChromeLayout.sidebarToggleOwner === "window" ? (
+          <WindowChromeRegion corners="top-left">
+            <WindowChromeSafeArea
+              placement="inline"
+              horizontalPadding={WINDOW_SIDEBAR_TOGGLE_HORIZONTAL_PADDING}
+              pointerEvents="box-none"
+              style={layoutStyles.windowSidebarToggle}
+            >
+              <WindowSidebarMenuToggle />
+            </WindowChromeSafeArea>
+          </WindowChromeRegion>
+        ) : null}
+        <UtilityTrayTriggerHost />
+        <DesktopWindowControls />
+        <FloatingPanelPortalHost />
+        <UtilityTrayHost />
+      </AppearanceStyleBoundary>
+      {isCompactLayout ? themedSidebarChrome : null}
+      <AppearanceStyleBoundary>
+        <DownloadToast />
+        <RosettaCalloutSource />
+        <UpdateCalloutSource />
+        <LegacyAgentSkillsMigration />
+        <WorktreeSetupCalloutSource />
+        <CommandCenterRootActions />
+        <CommandCenterWorkspaceActions />
+        <PluginCommandCenterActions />
+        <WorkspacePinShortcutHandler />
+        <WorkspaceRenameHost />
+        <WorkspaceArchiveUndoShortcutHost />
+        <CommandCenter />
+        <AddProjectFlowHost />
+        <HostChooserModal />
+        <HostConfirmationSheet />
+        <ProviderSettingsHost />
+        <WorkspaceSetupDialog />
+        <KeyboardShortcutsDialog />
+        <AppDiagnosticHost />
+        <ChangelogHost />
+        <QuittingOverlay />
+      </AppearanceStyleBoundary>
+      <OnboardingHost />
     </View>
   );
 
@@ -599,22 +614,28 @@ function AppContainerLifetime({
 function SidebarChrome({
   mounted,
   visible,
+  overlay,
   showActivityBar,
   keyboardShortcutsEnabled,
 }: {
   mounted: boolean;
   visible: boolean;
+  overlay: boolean;
   showActivityBar: boolean;
   keyboardShortcutsEnabled: boolean;
 }) {
   const isCompactLayout = useIsCompactFormFactor();
   const isMobileActive = useIsMobilePanelActive("agent-list");
-  const overlay = presentation === "overlay";
-  const active = resolveSidebarActivity(presentation !== "hidden", overlay, isMobileActive);
+  const active = resolveSidebarActivity(visible, isCompactLayout, isMobileActive);
   const hardwareKeyboardPresent = useHardwareKeyboardPresent();
   return (
-    <SidebarModelProvider active={active}>
-      {mounted ? <LeftSidebar active={active} /> : null}
+    <SidebarModelProvider
+      active={active}
+      keyboardNavigationActive={keyboardShortcutsEnabled && hardwareKeyboardPresent}
+    >
+      {mounted ? (
+        <LeftSidebar active={active} desktopOverlay={overlay && !isCompactLayout} />
+      ) : null}
       {showActivityBar ? <SidebarActivityBar /> : null}
       <WorkspaceShortcutTargetsSubscriber enabled={keyboardShortcutsEnabled} />
     </SidebarModelProvider>

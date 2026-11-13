@@ -48,21 +48,12 @@ import { useToast } from "@/contexts/toast-context";
 import { toErrorMessage } from "@/utils/error-messages";
 import { showProviderNoticeToast } from "@/utils/provider-notice-toast";
 import { applyCheckoutStatusUpdateFromEvent } from "@/git/checkout-status-cache";
-import { useProviderSubagentStore } from "@/subagents/provider-store";
+import { resyncProviderSubagents, useProviderSubagentStore } from "@/subagents/provider-store";
 import { revalidateSessionAfterResume } from "@/contexts/session-resume-revalidation";
 import {
   shouldSuppressSnoozedAttentionNotification,
   useCockpitSnoozeStore,
 } from "@/stores/cockpit-snooze-store";
-
-function consumeForcedTimelineTailReplacement(
-  payload: TimelineResponsePayload,
-  replacements: Set<string>,
-): TimelineResponsePayload {
-  if (payload.direction !== "tail") return payload;
-  if (!replacements.delete(payload.agentId)) return payload;
-  return { ...payload, reset: true };
-}
 
 function shouldSuppressDesktopAgentAttention(input: {
   reason: "finished" | "error" | "permission";
@@ -237,6 +228,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
   const setAgentStreamHead = useSessionStore((state) => state.setAgentStreamHead);
   const clearAgentStreamHead = useSessionStore((state) => state.clearAgentStreamHead);
   const setInitializingAgents = useSessionStore((state) => state.setInitializingAgents);
+  const bumpHistorySyncGeneration = useSessionStore((state) => state.bumpHistorySyncGeneration);
   const setAgents = useSessionStore((state) => state.setAgents);
   const flushAgentLastActivity = useSessionStore((state) => state.flushAgentLastActivity);
   const setPendingPermissions = useSessionStore((state) => state.setPendingPermissions);
@@ -272,11 +264,19 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
     viewedTimelineSyncRef.current?.setActive(isAppVisible);
   }, [isAppVisible]);
 
+  const handleAppResumed = useCallback(
+    (awayMs: number) => {
+      void revalidateSessionAfterResume({ awayMs, serverId, bumpHistorySyncGeneration });
+    },
+    [bumpHistorySyncGeneration, serverId],
+  );
+
   // Client activity tracking (heartbeat, push token registration)
   useClientActivity({
     client,
     focusedAgentId,
     focusedTerminalId,
+    onAppResumed: handleAppResumed,
   });
   useEffect(() => startPushNotifications({ client, serverId }), [client, serverId]);
 
@@ -524,12 +524,9 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
         },
       });
 
-      // NOTE: We don't update lastActivityAt on every stream event to prevent
-      // cascading rerenders. The agent_update handler updates agent.lastActivityAt
-      // on status changes, which is sufficient for sorting and display purposes.
-    });
-
-    const unsubAgentAttention = client.onAgentAttentionRequired((notification) => {
+    const unsubAgentAttention = onFeed("agent_attention_required", (message) => {
+      if (message.type !== "agent_attention_required") return;
+      const notification = message.payload;
       const session = useSessionStore.getState().sessions[serverId];
       const workspaceId =
         notification.notification?.data.workspaceId ??

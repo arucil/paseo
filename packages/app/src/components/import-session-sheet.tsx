@@ -382,6 +382,123 @@ function ImportSessionSheetRow({
   );
 }
 
+function ImportSessionActivityTime({ date }: { date: string }) {
+  const label = useTimeAgo(new Date(date));
+  return <Text style={styles.rowMeta}>{label}</Text>;
+}
+
+function getSessionRowKey(entry: FetchRecentProviderSessionEntry): string {
+  return `${entry.providerId}:${entry.providerHandleId}`;
+}
+
+function hasListHeader(
+  input: SheetStatusMessagesProps & {
+    showFilter: boolean;
+    hasProviderErrors: boolean;
+  },
+): boolean {
+  return (
+    input.showFilter ||
+    !input.isClientReady ||
+    input.isSnapshotUnsupported ||
+    input.hasNoImportableProviders ||
+    (input.isLoadingSessions && !input.hasRows) ||
+    input.importErrored ||
+    input.hasProviderErrors
+  );
+}
+
+function SessionRows({
+  visible,
+  onClose,
+  header,
+  listHeader,
+  listFooter,
+  serverId,
+  entries,
+  disabled,
+  importingSessionKey,
+  resolveFolder,
+  onImportSession,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  header: SheetHeader;
+  listHeader: ReactNode;
+  listFooter: ReactNode;
+  serverId: string | null;
+  entries: ReadonlyArray<FetchRecentProviderSessionEntry>;
+  disabled: boolean;
+  importingSessionKey: string | null;
+  resolveFolder: (entry: FetchRecentProviderSessionEntry) => string | null;
+  onImportSession: (entry: FetchRecentProviderSessionEntry) => void;
+}) {
+  // Keep short results content-sized; only long lists need a bounded viewport.
+  const virtualized = ImportSessionList !== null && entries.length > 8;
+  const renderSessionRow = useCallback(
+    (entry: FetchRecentProviderSessionEntry) => (
+      <ImportSessionSheetRow
+        key={getSessionRowKey(entry)}
+        serverId={serverId}
+        entry={entry}
+        disabled={disabled}
+        importing={importingSessionKey === getSessionRowKey(entry)}
+        folder={resolveFolder(entry)}
+        onImportSession={onImportSession}
+      />
+    ),
+    [serverId, disabled, importingSessionKey, resolveFolder, onImportSession],
+  );
+  const renderItem = useCallback(
+    (item: FetchRecentProviderSessionEntry) => (
+      <View style={styles.listRow}>{renderSessionRow(item)}</View>
+    ),
+    [renderSessionRow],
+  );
+  const virtualHeader = useMemo(
+    () => (listHeader ? <View style={styles.listHeader}>{listHeader}</View> : null),
+    [listHeader],
+  );
+  const virtualFooter = useMemo(
+    () => <View style={styles.listFooter}>{listFooter}</View>,
+    [listFooter],
+  );
+
+  return (
+    <AdaptiveModalSheet
+      visible={visible}
+      onClose={onClose}
+      header={header}
+      testID="import-session-sheet"
+      desktopMaxWidth={560}
+      desktopHeight={virtualized ? "85%" : undefined}
+      snapPoints={IMPORT_SHEET_SNAP_POINTS}
+      scrollable={!virtualized}
+      contentStyle={virtualized ? styles.listBody : undefined}
+    >
+      {ImportSessionList && virtualized ? (
+        <View style={styles.list}>
+          <ImportSessionList
+            data={entries}
+            keyExtractor={getSessionRowKey}
+            renderItem={renderItem}
+            header={virtualHeader}
+            footer={virtualFooter}
+          />
+        </View>
+      ) : (
+        <>
+          {listHeader}
+          {entries.length > 0 ? (
+            <View style={styles.smallList}>{entries.map(renderSessionRow)}</View>
+          ) : null}
+          {listFooter}
+        </>
+      )}
+    </AdaptiveModalSheet>
+  );
+}
+
 function resolvePendingImportConfig(
   entry: FetchRecentProviderSessionEntry,
   snapshotEntries: ProviderSnapshotEntry[] | undefined,
@@ -757,7 +874,7 @@ export function ImportSessionSheet({
         providerId: entry.providerId,
         providerHandleId: entry.providerHandleId,
         cwd: entry.cwd,
-        ...(workspaceId ? { workspaceId } : {}),
+        ...(target.workspaceId ? { workspaceId: target.workspaceId } : {}),
         ...(modeId ? { modeId } : {}),
       });
       return { agent, target };
@@ -887,97 +1004,146 @@ export function ImportSessionSheet({
     providerLabelById,
   });
   const showFilter = filterProviders.length > 1;
-  const SelectedProviderIcon =
-    selectedProvider === ALL_FILTER_VALUE ? null : getProviderIcon(selectedProvider);
-
-  const filterControl = showFilter ? (
-    <View ref={filterAnchorRef} collapsable={false} style={styles.filterTriggerWrap}>
-      <Pressable
-        onPress={handleFilterOpen}
-        style={filterTriggerStyle}
-        testID="import-session-filter-trigger"
-        accessibilityRole="button"
-        accessibilityLabel={`Filter: ${selectedProviderLabel}`}
-      >
-        {SelectedProviderIcon ? (
-          <SelectedProviderIcon size={14} color={theme.colors.foregroundMuted} />
-        ) : (
-          <Layers size={14} color={theme.colors.foregroundMuted} />
-        )}
-        <Text style={styles.filterTriggerText} numberOfLines={1}>
-          {selectedProviderLabel}
-        </Text>
-        <ChevronDown size={14} color={theme.colors.foregroundMuted} />
-      </Pressable>
-      <Combobox
-        options={filterComboboxOptions}
-        value={selectedProvider}
-        onSelect={handleFilterSelect}
-        renderOption={renderFilterOption}
-        searchable={false}
-        title="Filter by provider"
-        open={isFilterOpen}
-        onOpenChange={setIsFilterOpen}
-        anchorRef={filterAnchorRef}
-        desktopPlacement="bottom-start"
-        desktopPreventInitialFlash
-      />
-    </View>
-  ) : null;
-
-  const sessionList = (
-    <>
-      {filterControl}
-      <SheetStatusMessages
-        isClientReady={Boolean(client)}
-        isSnapshotUnsupported={isSnapshotUnsupported}
-        hasNoImportableProviders={hasNoImportableProviders}
-        isLoadingSessions={isLoadingSessions}
-        hasRows={visibleEntries.length > 0}
-        allQueriesErrored={allQueriesErrored}
-        erroredProviderLabels={erroredProviderLabels}
-        importErrored={importMutation.isError}
-      />
-      {visibleEntries.length > 0 ? (
-        <View style={styles.list}>
-          {visibleEntries.map((entry) => (
-            <ImportSessionSheetRow
-              key={`${entry.providerId}:${entry.providerHandleId}`}
-              entry={entry}
-              disabled={importMutation.isPending}
-              importing={importingSessionKey === `${entry.providerId}:${entry.providerHandleId}`}
-              showCwd={!cwd}
-              onImportSession={handleImportSession}
-            />
-          ))}
+  const showLoadMore = hasMoreSessions(queries, pageLimit);
+  const showListHeader = hasListHeader({
+    showFilter,
+    isClientReady: Boolean(client),
+    isSnapshotUnsupported,
+    hasNoImportableProviders,
+    isLoadingSessions,
+    hasRows: visibleEntries.length > 0,
+    importErrored: importMutation.isError,
+    hasProviderErrors: providerErrorRows.length > 0,
+  });
+  const listHeader = useMemo(
+    () =>
+      showListHeader ? (
+        <View style={styles.listHeaderContent}>
+          {showFilter ? (
+            <View ref={filterAnchorRef} collapsable={false} style={styles.filterTriggerWrap}>
+              <Pressable
+                onPress={handleFilterOpen}
+                style={filterTriggerStyle}
+                testID="import-session-filter-trigger"
+                accessibilityRole="button"
+                accessibilityLabel={`Filter: ${selectedProviderLabel}`}
+              >
+                {selectedProvider === ALL_FILTER_VALUE ? (
+                  <Layers size={14} color={theme.colors.foregroundMuted} />
+                ) : (
+                  <SelectedProviderIcon size={14} color={theme.colors.foregroundMuted} />
+                )}
+                <Text style={styles.filterTriggerText} numberOfLines={1}>
+                  {selectedProviderLabel}
+                </Text>
+                <ChevronDown size={14} color={theme.colors.foregroundMuted} />
+              </Pressable>
+              <Combobox
+                options={filterComboboxOptions}
+                value={selectedProvider}
+                onSelect={handleFilterSelect}
+                renderOption={renderFilterOption}
+                searchable={false}
+                title="Filter by provider"
+                open={isFilterOpen}
+                onOpenChange={setIsFilterOpen}
+                anchorRef={filterAnchorRef}
+                desktopPlacement="bottom-start"
+                desktopPreventInitialFlash
+              />
+            </View>
+          ) : null}
+          <SheetStatusMessages
+            isClientReady={Boolean(client)}
+            isSnapshotUnsupported={isSnapshotUnsupported}
+            hasNoImportableProviders={hasNoImportableProviders}
+            isLoadingSessions={isLoadingSessions}
+            hasRows={visibleEntries.length > 0}
+            importErrored={importMutation.isError}
+          />
+          {providerErrorRows.length > 0 ? (
+            <ProviderErrorBanner rows={providerErrorRows} onRetry={handleRetryProvider} />
+          ) : null}
         </View>
-      ) : null}
-      {showEmptyState ? <SheetEmptyState title={emptyStateTitle} /> : null}
-    </>
+      ) : null,
+    [
+      showListHeader,
+      showFilter,
+      filterTriggerStyle,
+      handleFilterOpen,
+      selectedProvider,
+      theme.colors.foregroundMuted,
+      SelectedProviderIcon,
+      selectedProviderLabel,
+      filterComboboxOptions,
+      handleFilterSelect,
+      renderFilterOption,
+      isFilterOpen,
+      client,
+      isSnapshotUnsupported,
+      hasNoImportableProviders,
+      isLoadingSessions,
+      visibleEntries.length,
+      importMutation.isError,
+      providerErrorRows,
+      handleRetryProvider,
+    ],
   );
-
-  return (
-    <AdaptiveModalSheet
-      visible={visible}
-      onClose={onClose}
-      header={header}
-      testID="import-session-sheet"
-      desktopMaxWidth={560}
-      snapPoints={IMPORT_SHEET_SNAP_POINTS}
-    >
-      {pendingImport ? (
+  const listFooter = useMemo(
+    () => (
+      <>
+        {showLoadMore ? (
+          <View style={styles.footer}>
+            <Button
+              variant="ghost"
+              onPress={handleLoadMore}
+              disabled={isRefreshing}
+              testID="import-session-load-more"
+            >
+              {t("importSession.actions.loadMore")}
+            </Button>
+          </View>
+        ) : null}
+        {showEmptyState ? <SheetEmptyState title={emptyStateTitle} /> : null}
+      </>
+    ),
+    [showLoadMore, handleLoadMore, isRefreshing, t, showEmptyState, emptyStateTitle],
+  );
+  if (pendingImport) {
+    return (
+      <AdaptiveModalSheet
+        visible={visible}
+        onClose={onClose}
+        header={header}
+        testID="import-session-sheet"
+        desktopMaxWidth={560}
+        snapPoints={IMPORT_SHEET_SNAP_POINTS}
+      >
         <ImportSessionModeStep
-          key={`${pendingImport.entry.providerId}:${pendingImport.entry.providerHandleId}`}
+          key={getSessionRowKey(pendingImport.entry)}
           config={pendingImport}
           importing={importMutation.isPending}
           importErrored={importMutation.isError}
           onBack={handleModeBack}
           onImport={handleConfiguredImport}
         />
-      ) : (
-        sessionList
-      )}
-    </AdaptiveModalSheet>
+      </AdaptiveModalSheet>
+    );
+  }
+  return (
+    <SessionRows
+      visible={visible}
+      onClose={onClose}
+      header={header}
+      listHeader={listHeader}
+      listFooter={listFooter}
+      serverId={serverId}
+      entries={visibleEntries}
+      disabled={importMutation.isPending}
+      importingSessionKey={importingSessionKey}
+      resolveFolder={resolveFolder}
+      onImportSession={handleImportSession}
+    />
   );
 }
 

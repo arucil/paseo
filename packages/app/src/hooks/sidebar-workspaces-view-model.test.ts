@@ -442,6 +442,8 @@ describe("shared sidebar workspace model", () => {
       {
         serverId: "srv",
         workspaceAgentActivity: new Map(),
+        agentStreamTail: new Map(),
+        agentStreamHead: new Map(),
         workspaces: new Map([
           ["one", one],
           ["two", two],

@@ -470,7 +470,7 @@ it("creates a terminal through the worker and streams output", async () => {
 it("creates an unowned terminal through the worker", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "worker-terminal-manager-unowned-"));
   temporaryDirs.push(cwd);
-  manager = createWorkerTerminalManager();
+  manager = await startRealWorkerManager();
   const session = trackTerminal(
     await manager.createTerminal({
       cwd,
@@ -488,7 +488,7 @@ it("preserves an exit that arrives before the create promise continuation", asyn
   const worker = new FakeTerminalWorker();
   manager = createWorkerTerminalManager({
     requestTimeoutMs: 50,
-    forkWorker: () => worker,
+    worker,
   });
   const creation = manager.createTerminal({
     id: "terminal-fast-exit",

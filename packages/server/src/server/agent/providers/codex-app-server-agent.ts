@@ -2198,138 +2198,54 @@ async function loadCodexThreadHistoryTimeline(params: {
   return { timeline, subAgentRoutes };
 }
 
-const CODEX_HISTORY_PAGE_SIZE = 100;
-
-class CodexHistoryPaginationError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "CodexHistoryPaginationError";
-  }
-}
-
-async function readCodexThread(
-  client: CodexAppServerClientLike,
-  threadId: string,
-): Promise<unknown> {
-  const metadataResponse = await client.request("thread/read", { threadId });
-  const response = toObjectRecord(metadataResponse);
-  const thread = toObjectRecord(response?.thread);
-  if (!response || !thread) {
-    throw new CodexHistoryPaginationError(`Codex thread/read returned no thread: ${threadId}`);
-  }
-
-  const existingTurns = Array.isArray(thread.turns) ? thread.turns : [];
-  if (thread.historyMode !== "paginated") {
-    if (existingTurns.length > 0) {
-      return metadataResponse;
-    }
-    return client.request("thread/read", { threadId, includeTurns: true });
-  }
-
-  const turns = await readPaginatedCodexTurns(client, threadId);
-  return {
-    ...response,
-    thread: {
-      ...thread,
-      turns,
-    },
-  };
-}
-
-async function readPaginatedCodexTurns(
-  client: CodexAppServerClientLike,
-  threadId: string,
-): Promise<unknown[]> {
-  const turns: unknown[] = [];
-  const visitedCursors = new Set<string>();
-  let cursor: string | undefined;
-
-  while (true) {
-    const pageResponse = await client.request("thread/turns/list", {
-      threadId,
-      ...(cursor === undefined ? {} : { cursor }),
-      limit: CODEX_HISTORY_PAGE_SIZE,
-      sortDirection: "asc",
-      itemsView: "notLoaded",
-    });
-    const page = toObjectRecord(pageResponse);
-    if (!page || !Array.isArray(page.data)) {
-      throw new CodexHistoryPaginationError(
-        `Codex thread/turns/list returned an invalid page: ${threadId}`,
+async function projectCodexThreadHistory(
+  params: { client: CodexAppServerClientLike; threadId: string; cwd: string | null },
+  projection: {
+    timeline: PersistedTimelineEntry[];
+    subAgentTimelineIndexByThreadId: Map<string, number>;
+  },
+): Promise<void> {
+  const { timeline, subAgentTimelineIndexByThreadId } = projection;
+  for await (const row of readCodexThreadHistory(params.client, params.threadId)) {
+    const { item } = row;
+    const historicalSubAgentActivity = readCodexSubAgentActivity(item);
+    if (historicalSubAgentActivity) {
+      const existingIndex = subAgentTimelineIndexByThreadId.get(
+        historicalSubAgentActivity.agentThreadId,
       );
-    }
-
-    for (const rawTurn of page.data) {
-      const turn = toObjectRecord(rawTurn);
-      const turnId = turn?.id;
-      if (!turn || typeof turnId !== "string") {
-        throw new CodexHistoryPaginationError(
-          `Codex thread/turns/list returned a turn without an id: ${threadId}`,
+      if (existingIndex !== undefined) {
+        const activityTimelineItem = await threadItemToTimeline(item, { cwd: params.cwd });
+        updateHistoricalSubAgentActivity(
+          timeline,
+          existingIndex,
+          historicalSubAgentActivity.kind,
+          activityTimelineItem?.type === "tool_call" &&
+            activityTimelineItem.detail.type === "sub_agent"
+            ? activityTimelineItem.detail.subAgentType
+            : undefined,
         );
+        continue;
       }
-      const items = await readPaginatedCodexItems(client, threadId, turnId);
-      turns.push({ ...turn, items, itemsView: "full" });
     }
-
-    const nextCursor = page.nextCursor;
-    if (nextCursor === null) {
-      return turns;
-    }
-    if (typeof nextCursor !== "string" || visitedCursors.has(nextCursor)) {
-      throw new CodexHistoryPaginationError(
-        `Codex thread/turns/list returned an invalid cursor: ${threadId}`,
-      );
-    }
-    visitedCursors.add(nextCursor);
-    cursor = nextCursor;
-  }
-}
-
-async function readPaginatedCodexItems(
-  client: CodexAppServerClientLike,
-  threadId: string,
-  turnId: string,
-): Promise<unknown[]> {
-  const items: unknown[] = [];
-  const visitedCursors = new Set<string>();
-  let cursor: string | undefined;
-
-  while (true) {
-    const pageResponse = await client.request("thread/items/list", {
-      threadId,
-      turnId,
-      ...(cursor === undefined ? {} : { cursor }),
-      limit: CODEX_HISTORY_PAGE_SIZE,
-      sortDirection: "asc",
-    });
-    const page = toObjectRecord(pageResponse);
-    if (!page || !Array.isArray(page.data)) {
-      throw new CodexHistoryPaginationError(
-        `Codex thread/items/list returned an invalid page: ${threadId}/${turnId}`,
-      );
-    }
-
-    for (const rawEntry of page.data) {
-      const entry = toObjectRecord(rawEntry);
-      if (!entry || entry.turnId !== turnId || !("item" in entry)) {
-        throw new CodexHistoryPaginationError(
-          `Codex thread/items/list returned an invalid item: ${threadId}/${turnId}`,
-        );
+    for (const timelineItem of await threadItemToTimelineEntries(item, { cwd: params.cwd })) {
+      const timestamp =
+        readCodexHistoryTimestamp(item) ?? readCodexHistoryRowTimestamp(row, timelineItem);
+      const settledTimelineItem =
+        historicalSubAgentActivity && timelineItem.type === "tool_call"
+          ? settleHistoricalSubAgentActivity(timelineItem, historicalSubAgentActivity.kind)
+          : timelineItem;
+      timeline.push({
+        // Cap each item as it is projected so a large history is never held uncapped.
+        item: limitAgentTimelineItemContent(settledTimelineItem),
+        timestamp: timestamp ?? undefined,
+        ...(timelineItem.type === "user_message" && row.turnId !== undefined
+          ? { providerTurnId: row.turnId }
+          : {}),
+      });
+      for (const childThreadId of readCodexHistoricalSubAgentThreadIds(item)) {
+        subAgentTimelineIndexByThreadId.set(childThreadId, timeline.length - 1);
       }
-      items.push(entry.item);
     }
-
-    const nextCursor = page.nextCursor;
-    if (nextCursor === null) {
-      return items;
-    }
-    if (typeof nextCursor !== "string" || visitedCursors.has(nextCursor)) {
-      throw new CodexHistoryPaginationError(
-        `Codex thread/items/list returned an invalid cursor: ${threadId}/${turnId}`,
-      );
-    }
-    visitedCursors.add(nextCursor);
-    cursor = nextCursor;
   }
 }
 
@@ -4382,10 +4298,13 @@ export class CodexAppServerAgentSession implements AgentSession {
 
   private async ensureThreadLoaded(): Promise<void> {
     if (!this.client || !this.currentThreadId) return;
-    const params: Record<string, unknown> = {
-      threadId: this.currentThreadId,
-      excludeTurns: true,
-    };
+    // Paseo reads history only when it replays it; the resume response needs no turns.
+    const params: Record<string, unknown> = { threadId: this.currentThreadId, excludeTurns: true };
+    if (this.deps.customCodexConfig) {
+      // Resume otherwise prefers the provider stored on the thread, including
+      // the unnamespaced key emitted by earlier Paseo versions.
+      params.modelProvider = this.deps.customCodexConfig.model_provider;
+    }
     const developerInstructions = composeSystemPromptParts(
       this.config.systemPrompt,
       this.config.daemonAppendSystemPrompt,
@@ -7885,32 +7804,55 @@ export class CodexAppServerAgentClient implements AgentClient {
     }
   }
 
-  private async spawnAppServer(
-    launchEnv?: Record<string, string>,
-    options?: { goalsEnabled?: boolean; agentId?: string; cwd?: string },
-  ): Promise<ChildProcessWithoutNullStreams> {
-    const launchPrefix = await resolveCodexLaunchPrefix(this.runtimeSettings);
+  private async prepareAppServerSpawn(options: {
+    environment: Record<string, string>;
+    goalsEnabled?: boolean;
+    agentId?: string;
+    cwd?: string;
+  }): Promise<() => ChildProcessWithoutNullStreams> {
+    const processPort = this.deps.appServerProcess ?? defaultCodexAppServerProcess;
+    const launchPrefix = await processPort.resolvePrefix({ runtimeSettings: this.runtimeSettings });
     const args = [...launchPrefix.args, "app-server"];
     if (options.goalsEnabled) {
       args.push("--enable", "goals");
     }
-    this.logger.trace(
-      {
-        agentId: options?.agentId,
-        provider: CODEX_PROVIDER,
-        launchPrefix,
-        goalsEnabled: options?.goalsEnabled === true,
-      },
-      "provider.codex.spawn",
-    );
-    const child = spawnProcess(launchPrefix.command, args, {
-      cwd: options?.cwd ?? os.homedir(),
-      detached: process.platform !== "win32",
-      stdio: ["pipe", "pipe", "pipe"],
-      ...createProviderEnvSpec({
-        runtimeSettings: this.runtimeSettings,
-        overlays: [launchEnv],
-      }),
+    return () => {
+      this.logger.trace(
+        {
+          agentId: options.agentId,
+          provider: CODEX_PROVIDER,
+          launchPrefix,
+          goalsEnabled: options.goalsEnabled === true,
+        },
+        "provider.codex.spawn",
+      );
+      const child = processPort.spawn({
+        command: launchPrefix.command,
+        args,
+        options: {
+          cwd: options.cwd ?? os.homedir(),
+          detached: process.platform !== "win32",
+          stdio: ["pipe", "pipe", "pipe"],
+          baseEnv: options.environment,
+        },
+      });
+      assertChildWithPipes(child);
+      return child;
+    };
+  }
+
+  private async startAppServer(
+    options: { signal?: AbortSignal } = {},
+  ): Promise<CodexAppServerClient> {
+    const environment = buildCodexAppServerEnv(this.runtimeSettings);
+    const spawn = await this.prepareAppServerSpawn({ environment });
+    const { client } = await codexAppServerStartup.start({
+      stateDirKey: codexStartupStateDirKey(environment),
+      spawn,
+      createClient: (child) => new CodexAppServerClient(child, this.logger),
+      initializeParams: buildCodexAppServerInitializeParams(),
+      logger: this.logger,
+      signal: options.signal,
     });
     return client;
   }
@@ -7935,18 +7877,14 @@ export class CodexAppServerAgentClient implements AgentClient {
       environment,
       goalsEnabled,
       agentId: launchContext?.agentId,
+      cwd: sessionConfig.cwd,
     });
     const session = new CodexAppServerAgentSession(
       sessionConfig,
       null,
       this.logger,
-      () =>
-        this.spawnAppServer(launchContext?.env, {
-          goalsEnabled,
-          agentId: launchContext?.agentId,
-          cwd: sessionConfig.cwd,
-        }),
-      this.sessionDeps(),
+      async () => spawn(),
+      { ...this.sessionDeps(launchContext?.env), environment },
       options?.persistSession === false,
       goalsEnabled,
       autoReviewEnabled,
@@ -7977,18 +7915,14 @@ export class CodexAppServerAgentClient implements AgentClient {
       environment,
       goalsEnabled,
       agentId: launchContext?.agentId,
+      cwd: merged.cwd,
     });
     const session = new CodexAppServerAgentSession(
       merged,
       handle,
       this.logger,
-      () =>
-        this.spawnAppServer(launchContext?.env, {
-          goalsEnabled,
-          agentId: launchContext?.agentId,
-          cwd: merged.cwd,
-        }),
-      this.sessionDeps(),
+      async () => spawn(),
+      { ...this.sessionDeps(launchContext?.env), environment },
       false,
       goalsEnabled,
       autoReviewEnabled,
@@ -8002,10 +7936,17 @@ export class CodexAppServerAgentClient implements AgentClient {
   async listImportableSessions(
     options?: ListImportableSessionsOptions,
   ): Promise<ImportableProviderSession[]> {
-    const child = await this.spawnAppServer(undefined, { cwd: options?.cwd });
-    const client =
-      this.deps._createCodexClient?.(child, this.logger, () => ({})) ??
-      new CodexAppServerClient(child, this.logger);
+    const environment = buildCodexAppServerEnv(this.runtimeSettings);
+    const spawn = await this.prepareAppServerSpawn({ environment, cwd: options?.cwd });
+    const { client } = await codexAppServerStartup.start({
+      stateDirKey: codexStartupStateDirKey(environment),
+      spawn,
+      createClient: (child) =>
+        this.deps._createCodexClient?.(child, this.logger, () => ({})) ??
+        new CodexAppServerClient(child, this.logger),
+      initializeParams: buildCodexAppServerInitializeParams(),
+      logger: this.logger,
+    });
 
     try {
       const limit = options?.limit ?? 20;

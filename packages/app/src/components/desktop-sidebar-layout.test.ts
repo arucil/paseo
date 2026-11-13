@@ -13,7 +13,7 @@ import {
   resolveDesktopSidebarVisibility,
   resolveSidebarActivity,
   resolveDesktopSidebarWidth,
-  resolveLeftSidebarPresentation,
+  resolveDesktopSidebarInsetLeft,
 } from "@/components/desktop-sidebar-layout";
 
 describe("desktop sidebar layout", () => {

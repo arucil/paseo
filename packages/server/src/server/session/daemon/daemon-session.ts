@@ -59,7 +59,7 @@ export interface DaemonSessionOptions {
   getObservationMetrics?: () => Record<string, number>;
   logger: pino.Logger;
   hubRelationships?: HubRelationshipManagement;
-  reloadConfig: () => DaemonConfigReloadResult;
+  reloadConfig: () => Promise<DaemonConfigReloadResult>;
   getSystemUsage?: () => DaemonSystemUsage;
 }
 
@@ -87,7 +87,7 @@ export class DaemonSession {
   private readonly logger: pino.Logger;
   private readonly selfUpdate: DaemonSelfUpdateSessionController;
   private readonly hubRelationships: HubRelationshipManagement | null;
-  private readonly reloadConfig: () => DaemonConfigReloadResult;
+  private readonly reloadConfig: () => Promise<DaemonConfigReloadResult>;
   private readonly getSystemUsage: () => DaemonSystemUsage;
 
   constructor(options: DaemonSessionOptions) {
@@ -184,6 +184,10 @@ export class DaemonSession {
   async handleGetStatusRequest(
     msg: Extract<SessionInboundMessage, { type: "daemon.get_status.request" }>,
   ): Promise<void> {
+    const terminalCleanupUnconfirmed = (await readUnconfirmedTerminalCleanup(this.paseoHome)).map(
+      ({ pid, role, reason, detail }) => ({ pid, role, reason, detail }),
+    );
+    const terminalsUnavailable = this.getTerminalsUnavailable();
     let startedAt: string | null = null;
     try {
       const pidInfo = await getPidLockInfo(this.paseoHome);
@@ -229,6 +233,8 @@ export class DaemonSession {
         relay: this.daemonRuntimeConfig?.getRelayConfig() ?? null,
         providers,
         systemUsage,
+        terminalCleanupUnconfirmed,
+        ...(terminalsUnavailable ? { terminalsUnavailable } : {}),
       },
     });
   }

@@ -1202,9 +1202,11 @@ export class Session {
       sessionLogger: this.sessionLogger,
       listTerminalWorkspaceRefs: () => this.listActiveWorkspaceRefs(),
       isScriptTerminal: (terminal) =>
-        this.scriptRuntimeStore
+        terminal.workspaceId !== undefined &&
+        (this.scriptRuntimeStore
           ?.listForWorkspace(terminal.workspaceId)
-          .some((script) => script.terminalId === terminal.id) ?? false,
+          .some((script) => script.terminalId === terminal.id) ??
+          false),
       subscribeTerminalMetadata: (listener) =>
         this.scriptRuntimeStore?.subscribe(listener) ?? (() => {}),
       getClientBufferedAmount: (source) => this.getTransportBufferedAmount(source),
